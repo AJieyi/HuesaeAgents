@@ -1,234 +1,481 @@
-"""
-测试 agents 模块 - Phase1 表情包与语C能力
+"""Agent 测试
 
-使用方法:
-1. 激活虚拟环境: conda activate HuesaeAgents
-2. 安装依赖: pip install langchain langgraph langchain-core langchain-deepseek python-dotenv
-3. 确保 .env 文件中有 DEEPSEEK_API_KEY
-4. 运行: python huesae/agents/test/test_agents.py
+测试内容：
+1. 意图识别（LLM结构化输出）
+2. ImageAgent 三种模式（直接生图、转Danbooru标签、扩写提示词）
+3. 多轮对话流程（Graph级别）
+4. Provider 注册和调用
 """
-import asyncio
-import os
 import sys
-from dotenv import load_dotenv
+from pathlib import Path
 
-# 添加项目路径（指向 backend 目录，使 huesaeagents.huesae 可被导入）
-# 文件: backend/huesaeagents/huesae/agents/test/test_agents.py
-# test -> agents -> huesae -> huesaeagents -> backend (向上5层到backend)
-_test_file = os.path.abspath(__file__)
-project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(_test_file)))))
-# project_root = f:/agent/code/agent/HuesaeAgents/ben/HuesaeAgents/backend/
-os.chdir(project_root)  # 切换到项目根目录
-sys.path.insert(0, project_root)
+# 将 backend 目录添加到 Python 路径
+backend_dir = Path(__file__).resolve().parents[4]
+if str(backend_dir) not in sys.path:
+    sys.path.insert(0, str(backend_dir))
 
-# 加载 .env 文件
-load_dotenv()
-
+import pytest
+import asyncio
 from langchain_core.messages import HumanMessage
-from huesaeagents.huesae.agents.state import ThreadState
-from huesaeagents.huesae.agents.agent_factory import create_huesae_agent, create_image_agent
+
+from huesaeagents.huesae.agents.subagents.image_agent import (
+    ImageAgent,
+    ImageMode,
+    ImageStep,
+    create_image_agent,
+)
+from huesaeagents.huesae.agents.subagents.image.intent import (
+    recognize_intent,
+    ImageIntent,
+)
+from huesaeagents.huesae.agents.subagents.image import (
+    generate_tags,
+    expand_prompt,
+    DoubaoProvider,
+    JimengProvider,
+)
+from huesaeagents.huesae.models.models_factory import create_chat_model
 
 
-def test_create_agent():
-    """测试创建 Agent"""
-    print("\n1. 测试创建 Agent")
-    try:
-        agent = create_huesae_agent()
-        print(f"   Agent type: {type(agent).__name__}")
-        print("   ✅ create_huesae_agent 成功")
-        return agent
-    except Exception as e:
-        print(f"   ❌ create_huesae_agent 失败: {e}")
-        print(f"   错误类型: {type(e).__name__}")
-        return None
+# ============== 夹具 ==============
+
+@pytest.fixture(scope="module")
+def llm():
+    """共享的LLM实例"""
+    return create_chat_model("deepseek")
 
 
-def test_emotion_chat(agent, message: str, character_id: str = "gentle_sister"):
-    """
-    测试带情绪的对话
-
-    Args:
-        agent: Agent实例
-        message: 用户消息
-        character_id: 角色ID
-    """
-    try:
-        print(f"   用户: {message}")
-        result = agent.invoke({
-            "messages": [HumanMessage(content=message)],
-            "character_id": character_id,
-            "emotion_state": None,
-            "emotion_score": None,
-            "user_id": None,
-            "thread_id": None
-        })
-        # 获取最后一条 AI 消息
-        ai_message = result["messages"][-1]
-        print(f"   AI: {ai_message.content}")
-        print(f"   情绪: {result.get('emotion_state', 'N/A')}")
-        print()
-    except Exception as e:
-        print(f"   ❌ 对话失败: {e}")
-        print(f"   错误类型: {type(e).__name__}")
-        print()
+@pytest.fixture(scope="module")
+def image_agent(llm):
+    """共享的ImageAgent实例（不调用实际API）"""
+    return ImageAgent(llm=llm, providers=[])
 
 
-def test_emotion_detection(agent):
-    """测试情绪检测"""
-    print("\n2. 测试情绪检测")
+# ============== 测试：意图识别 ==============
 
-    test_cases = [
-        ("今天考试考砸了，好难过...", "gentle_sister"),
-        ("哈哈哈哈太开心了!", "gentle_sister"),
-        ("一个人好寂寞...", "gentle_sister"),
-        ("我不喜欢你!", "tsundere"),
-        ("有点不好意思...", "furry_fox"),
-    ]
+class TestIntentRecognition:
+    """测试LLM意图识别"""
 
-    for message, character_id in test_cases:
-        test_emotion_chat(agent, message, character_id)
+    def test_recognize_direct_image(self, llm):
+        """测试识别直接生图意图"""
+        result = recognize_intent("画一个银发红瞳的少女在河边", llm)
+        assert isinstance(result, ImageIntent)
+        assert result.intent == ImageMode.DIRECT_IMAGE
+        assert "银发" in result.extracted_prompt
+        assert "红瞳" in result.extracted_prompt
+        print(f"意图识别: {result.intent}, 提示词: {result.extracted_prompt}")
 
+    def test_recognize_convert_tags(self, llm):
+        """测试识别转Danbooru标签意图"""
+        result = recognize_intent("把这句话转成Danbooru标签：一个猫娘在咖啡馆", llm)
+        assert isinstance(result, ImageIntent)
+        assert result.intent == ImageMode.CONVERT_TAGS
+        assert "猫娘" in result.extracted_prompt or "咖啡馆" in result.extracted_prompt
+        print(f"意图识别: {result.intent}, 提示词: {result.extracted_prompt}")
 
-def test_character_switch(agent):
-    """测试角色切换"""
-    print("\n3. 测试角色切换")
+    def test_recognize_expand_prompt(self, llm):
+        """测试识别扩写提示词意图"""
+        result = recognize_intent("扩写：夕阳下的战舰", llm)
+        assert isinstance(result, ImageIntent)
+        assert result.intent == ImageMode.EXPAND_PROMPT
+        assert "夕阳" in result.extracted_prompt or "战舰" in result.extracted_prompt
+        print(f"意图识别: {result.intent}, 提示词: {result.extracted_prompt}")
 
-    message = "今天好开心!"
-
-    characters = ["gentle_sister", "tsundere", "furry_fox"]
-    for character_id in characters:
-        print(f"   --- 角色: {character_id} ---")
-        test_emotion_chat(agent, message, character_id)
-
-
-def test_create_image_agent():
-    """测试创建图片 Agent"""
-    print("\n4. 测试创建图片 Agent")
-    try:
-        agent = create_image_agent()
-        print(f"   Agent type: {type(agent).__name__}")
-        print("   ✅ create_image_agent 成功")
-        return agent
-    except Exception as e:
-        print(f"   ❌ create_image_agent 失败: {e}")
-        print(f"   错误类型: {type(e).__name__}")
-        return None
+    def test_recognize_chat(self, llm):
+        """测试识别普通对话意图"""
+        result = recognize_intent("今天天气怎么样？", llm)
+        assert isinstance(result, ImageIntent)
+        assert result.intent == ImageMode.CHAT
+        print(f"意图识别: {result.intent}")
 
 
-def test_image_generation(agent, message: str):
-    """
-    测试图片生成
+# ============== 测试：ImageAgent 流程 ==============
 
-    Args:
-        agent: Agent实例
-        message: 用户消息
-    """
-    try:
-        print(f"   用户: {message}")
-        result = agent.invoke({
-            "messages": [HumanMessage(content=message)],
-        })
-        # 获取最后一条 AI 消息
-        ai_message = result["messages"][-1]
-        print(f"   AI 响应类型: {type(ai_message).__name__}")
+class TestImageAgentFlow:
+    """测试 ImageAgent 各模式流程"""
 
-        # 检查是否有 tool_calls
-        if hasattr(ai_message, "tool_calls") and ai_message.tool_calls:
-            print(f"   调用了工具: {[tc['name'] for tc in ai_message.tool_calls]}")
+    # ---- 模式A：直接生图 ----
 
-        # 检查返回的内容
-        if hasattr(ai_message, "content") and ai_message.content:
-            content = ai_message.content
-            if len(content) > 200:
-                print(f"   AI: {content[:200]}...")
-            else:
-                print(f"   AI: {content}")
-        print()
-    except Exception as e:
-        print(f"   ❌ 图片生成失败: {e}")
-        print(f"   错误类型: {type(e).__name__}")
-        print()
+    def test_direct_image_input_short(self, image_agent):
+        """测试直接生图 - 提示词太短，需要补充"""
+        result = image_agent.process_input("画一个猫")
+        assert result["step"] == ImageStep.INPUT
+        assert result["need_more_input"] is True
+        assert "太短" in result["message"] or "详细" in result["message"]
+        print(f"短提示词处理: {result['message']}")
+
+    def test_direct_image_input_ok(self, image_agent):
+        """测试直接生图 - 正常提示词，进入选择工具"""
+        result = image_agent.process_input("画一个银发红瞳的少女在樱花树下")
+        assert result["step"] == ImageStep.SELECT_TOOL
+        assert result["mode"] == ImageMode.DIRECT_IMAGE
+        assert result["need_more_input"] is False
+        assert "请选择" in result["message"] or "工具" in result["message"]
+        print(f"正常提示词: {result['message']}")
+
+    def test_direct_image_select_tool(self, image_agent):
+        """测试选择生图工具"""
+        # 先进入选择工具状态
+        state = {
+            "step": ImageStep.SELECT_TOOL,
+            "mode": ImageMode.DIRECT_IMAGE,
+            "prompt": "银发红瞳的少女",
+        }
+        result = image_agent.process_step(state, "doubao")
+        assert result["step"] == ImageStep.GENERATE_IMAGE
+        assert result["selected_provider"] == "doubao"
+        print(f"选择工具: {result['message']}")
+
+    def test_direct_image_show_image_ok(self, image_agent):
+        """测试展示图片后用户说可以"""
+        state = {
+            "step": ImageStep.SHOW_IMAGE,
+            "mode": ImageMode.DIRECT_IMAGE,
+            "prompt": "银发红瞳的少女",
+        }
+        result = image_agent.process_step(state, "可以了")
+        assert result["step"] == ImageStep.FINISH
+        print(f"用户确认: {result['message']}")
+
+    def test_direct_image_show_image_regenerate(self, image_agent):
+        """测试展示图片后用户要求换一张"""
+        state = {
+            "step": ImageStep.SHOW_IMAGE,
+            "mode": ImageMode.DIRECT_IMAGE,
+            "prompt": "银发红瞳的少女",
+        }
+        result = image_agent.process_step(state, "换一张")
+        assert result["step"] == ImageStep.GENERATE_IMAGE
+        assert result["selected_provider"] == "doubao"
+        print(f"用户换图: {result['message']}")
+
+    # ---- 模式B：转Danbooru标签 ----
+
+    def test_convert_tags_input(self, image_agent):
+        """测试转Danbooru标签 - 初始输入"""
+        result = image_agent.process_input("转成Danbooru标签：一个猫娘在咖啡馆")
+        assert result["step"] == ImageStep.SHOW_TAGS
+        assert result["mode"] == ImageMode.CONVERT_TAGS
+        assert "danbooru_tags" in result
+        print(f"标签生成: {result['message'][:50]}...")
+
+    def test_convert_tags_regenerate(self, image_agent):
+        """测试标签不满意，重新生成"""
+        state = {
+            "step": ImageStep.SHOW_TAGS,
+            "mode": ImageMode.CONVERT_TAGS,
+            "prompt": "一个猫娘在咖啡馆",
+        }
+        result = image_agent.process_step(state, "换一版")
+        assert result["step"] == ImageStep.SHOW_TAGS
+        assert "danbooru_tags" in result
+        print(f"重新生成标签: {result['message'][:50]}...")
+
+    def test_convert_tags_finish(self, image_agent):
+        """测试标签满意，结束"""
+        state = {
+            "step": ImageStep.SHOW_TAGS,
+            "mode": ImageMode.CONVERT_TAGS,
+            "prompt": "一个猫娘在咖啡馆",
+        }
+        result = image_agent.process_step(state, "可以了")
+        assert result["step"] == ImageStep.FINISH
+        print(f"标签确认: {result['message']}")
+
+    # ---- 模式C：扩写提示词 ----
+
+    def test_expand_prompt_input(self, image_agent):
+        """测试扩写提示词 - 初始输入"""
+        result = image_agent.process_input("扩写：夕阳下的战舰")
+        assert result["step"] == ImageStep.SHOW_EXPANDED
+        assert result["mode"] == ImageMode.EXPAND_PROMPT
+        assert "expanded_prompt" in result
+        print(f"扩写结果: {result['expanded_prompt'][:50]}...")
+
+    def test_expand_prompt_regenerate(self, image_agent):
+        """测试扩写不满意，重新扩写"""
+        state = {
+            "step": ImageStep.SHOW_EXPANDED,
+            "mode": ImageMode.EXPAND_PROMPT,
+            "prompt": "夕阳下的战舰",
+        }
+        result = image_agent.process_step(state, "再写一版")
+        assert result["step"] == ImageStep.SHOW_EXPANDED
+        assert "expanded_prompt" in result
+        print(f"重新扩写: {result['expanded_prompt'][:50]}...")
+
+    def test_expand_prompt_finish(self, image_agent):
+        """测试扩写满意，结束"""
+        state = {
+            "step": ImageStep.SHOW_EXPANDED,
+            "mode": ImageMode.EXPAND_PROMPT,
+            "prompt": "夕阳下的战舰",
+        }
+        result = image_agent.process_step(state, "接受")
+        assert result["step"] == ImageStep.FINISH
+        print(f"扩写确认: {result['message']}")
+
+    # ---- 边界情况 ----
+
+    def test_need_more_input_then_continue(self, image_agent):
+        """测试补充输入后继续流程"""
+        # 第一次输入太短
+        result1 = image_agent.process_input("画一个猫")
+        assert result1["need_more_input"] is True
+
+        # 补充输入
+        state = {
+            "step": ImageStep.INPUT,
+            "mode": ImageMode.DIRECT_IMAGE,
+            "prompt": "",
+            "need_more_input": True,
+        }
+        result2 = image_agent.process_step(state, "画一个银发红瞳的少女在樱花树下")
+        assert result2["step"] == ImageStep.SELECT_TOOL
+        print(f"补充输入后: {result2['message']}")
+
+    def test_chat_fallback(self, image_agent):
+        """测试非生图意图的fallback"""
+        result = image_agent.process_input("你好，今天过得怎么样？")
+        assert result["mode"] == ImageMode.CHAT
+        assert result["step"] == ImageStep.FINISH
+        print(f"Chat fallback: {result['message']}")
 
 
-def test_image_agent():
-    """测试图片 Agent"""
+# ============== 测试：Graph 多轮对话 ==============
+
+class TestGraphMultiTurn:
+    """测试 Graph 级别的多轮对话"""
+
+    def test_graph_first_turn(self):
+        """测试 Graph 第一轮：用户输入生图请求"""
+        from huesaeagents.huesae.graph.huesae_graph import create_huesae_graph
+
+        graph = create_huesae_graph()
+        config = {"configurable": {"thread_id": "test_user_1"}}
+
+        result = graph.invoke(
+            {"messages": [HumanMessage(content="画一个银发红瞳的少女")]},
+            config=config,
+        )
+
+        # 应该进入image_agent，步骤为 SELECT_TOOL
+        assert result.get("image_step") == ImageStep.SELECT_TOOL
+        assert result.get("image_mode") == ImageMode.DIRECT_IMAGE
+        ai_msg = result["messages"][-1]
+        assert "请选择" in ai_msg.content or "工具" in ai_msg.content
+        print(f"Graph第一轮: {ai_msg.content[:60]}...")
+
+    def test_graph_second_turn(self):
+        """测试 Graph 第二轮：用户选择工具"""
+        from huesaeagents.huesae.graph.huesae_graph import create_huesae_graph
+
+        graph = create_huesae_graph()
+        config = {"configurable": {"thread_id": "test_user_2"}}
+
+        # 第一轮
+        graph.invoke(
+            {"messages": [HumanMessage(content="画一个银发红瞳的少女")]},
+            config=config,
+        )
+
+        # 第二轮：选择工具
+        result = graph.invoke(
+            {"messages": [HumanMessage(content="doubao")]},
+            config=config,
+        )
+
+        assert result.get("image_step") == ImageStep.GENERATE_IMAGE
+        assert result.get("selected_provider") == "doubao"
+        ai_msg = result["messages"][-1]
+        assert "doubao" in ai_msg.content.lower() or "豆包" in ai_msg.content
+        print(f"Graph第二轮: {ai_msg.content[:60]}...")
+
+    def test_graph_convert_tags_flow(self):
+        """测试 Graph 转Danbooru标签完整流程"""
+        from huesaeagents.huesae.graph.huesae_graph import create_huesae_graph
+
+        graph = create_huesae_graph()
+        config = {"configurable": {"thread_id": "test_user_3"}}
+
+        # 第一轮：请求转标签
+        result1 = graph.invoke(
+            {"messages": [HumanMessage(content="转成Danbooru标签：一个猫娘")]},
+            config=config,
+        )
+        assert result1.get("image_step") == ImageStep.SHOW_TAGS
+        assert result1.get("image_mode") == ImageMode.CONVERT_TAGS
+        assert result1.get("danbooru_tags") is not None
+
+        # 第二轮：确认
+        result2 = graph.invoke(
+            {"messages": [HumanMessage(content="可以了")]},
+            config=config,
+        )
+        assert result2.get("image_step") == ImageStep.FINISH
+        print(f"标签流程完成: {result2['messages'][-1].content[:60]}...")
+
+    def test_graph_expand_prompt_flow(self):
+        """测试 Graph 扩写提示词完整流程"""
+        from huesaeagents.huesae.graph.huesae_graph import create_huesae_graph
+
+        graph = create_huesae_graph()
+        config = {"configurable": {"thread_id": "test_user_4"}}
+
+        # 第一轮：请求扩写
+        result1 = graph.invoke(
+            {"messages": [HumanMessage(content="扩写：夕阳下的战舰")]},
+            config=config,
+        )
+        assert result1.get("image_step") == ImageStep.SHOW_EXPANDED
+        assert result1.get("image_mode") == ImageMode.EXPAND_PROMPT
+        assert result1.get("expanded_prompt") is not None
+
+        # 第二轮：确认
+        result2 = graph.invoke(
+            {"messages": [HumanMessage(content="接受")]},
+            config=config,
+        )
+        assert result2.get("image_step") == ImageStep.FINISH
+        print(f"扩写流程完成: {result2['messages'][-1].content[:60]}...")
+
+
+# ============== 测试：独立功能模块 ==============
+
+class TestDanbooruTags:
+    """测试 Danbooru 标签生成"""
+
+    def test_generate_tags(self, llm):
+        """测试生成Danbooru标签"""
+        tags = generate_tags("一个银发红瞳的少女在樱花树下", llm)
+        assert isinstance(tags, list)
+        assert len(tags) > 0
+        # 应该包含一些常见标签
+        tags_lower = [t.lower() for t in tags]
+        assert any("girl" in t or "1girl" in t for t in tags_lower)
+        print(f"生成的标签: {tags[:10]}")
+
+    def test_tags_to_prompt(self):
+        """测试标签拼接为提示词"""
+        from huesaeagents.huesae.agents.subagents.image import tags_to_prompt
+        tags = ["1girl", "silver hair", "red eyes"]
+        prompt = tags_to_prompt(tags)
+        assert prompt == "1girl, silver hair, red eyes"
+
+
+class TestExpandPrompt:
+    """测试提示词扩写"""
+
+    def test_expand_prompt(self, llm):
+        """测试扩写提示词"""
+        expanded = expand_prompt("夕阳下的战舰", llm)
+        assert isinstance(expanded, str)
+        assert len(expanded) > len("夕阳下的战舰")
+        assert "夕阳" in expanded or "战舰" in expanded
+        print(f"扩写结果: {expanded[:80]}...")
+
+
+class TestProviders:
+    """测试 Provider 注册"""
+
+    def test_register_provider(self, llm):
+        """测试注册Provider"""
+        agent = ImageAgent(llm=llm, providers=[])
+        assert len(agent.providers) == 0
+
+        agent.register_provider(DoubaoProvider())
+        assert "doubao" in agent.providers
+
+        agent.register_provider(JimengProvider())
+        assert "jimeng" in agent.providers
+        assert len(agent.providers) == 2
+
+    def test_available_providers(self, llm):
+        """测试获取可用Provider列表"""
+        agent = ImageAgent(
+            llm=llm,
+            providers=[DoubaoProvider(), JimengProvider()],
+        )
+        names = agent.get_available_providers()
+        assert "doubao" in names
+        assert "jimeng" in names
+
+
+# ============== 辅助函数：直接运行测试 ==============
+
+def run_all_tests():
+    """运行所有测试（不需要pytest）"""
+    llm = create_chat_model("deepseek")
+    agent = ImageAgent(llm=llm, providers=[])
+
     print("=" * 60)
-    print("测试图片 Agent - 图片生成能力集成")
+    print("ImageAgent 测试")
     print("=" * 60)
 
-    # 检查环境变量
-    print("\n0. 检查环境变量")
-    doubao_key = os.environ.get("DOUBAO_SEEDREAM_API_KEY")
-    if doubao_key:
-        print(f"   DOUBAO_SEEDREAM_API_KEY: 已设置 (长度={len(doubao_key)})")
-    else:
-        print("   DOUBAO_SEEDREAM_API_KEY: 未设置")
+    # 1. 意图识别
+    print("\n--- 测试1: 意图识别 ---")
+    for text, expected in [
+        ("画一个银发红瞳的少女", ImageMode.DIRECT_IMAGE),
+        ("转成Danbooru标签：猫娘", ImageMode.CONVERT_TAGS),
+        ("扩写：夕阳下的战舰", ImageMode.EXPAND_PROMPT),
+        ("今天天气怎么样", ImageMode.CHAT),
+    ]:
+        try:
+            intent = recognize_intent(text, llm)
+            status = "✓" if intent.intent == expected else "✗"
+            print(f"{status} '{text}' → {intent.intent} (期望: {expected})")
+        except Exception as e:
+            print(f"✗ '{text}' → 错误: {e}")
 
-    deepseek_key = os.environ.get("DEEPSEEK_API_KEY")
-    if deepseek_key:
-        print(f"   DEEPSEEK_API_KEY: 已设置 (长度={len(deepseek_key)})")
-    else:
-        print("   DEEPSEEK_API_KEY: 未设置")
-        print("   ⚠️ 跳过测试")
+    # 2. 直接生图流程
+    print("\n--- 测试2: 直接生图流程 ---")
+    result = agent.process_input("画一个银发红瞳的少女在樱花树下")
+    print(f"✓ 输入处理: step={result['step']}, mode={result['mode']}")
 
-    # 测试创建 Agent
-    agent = test_create_image_agent()
+    state = {
+        "step": ImageStep.SELECT_TOOL,
+        "mode": ImageMode.DIRECT_IMAGE,
+        "prompt": "银发红瞳的少女",
+    }
+    result = agent.process_step(state, "doubao")
+    print(f"✓ 选择工具: step={result['step']}, provider={result.get('selected_provider')}")
 
-    if not agent:
-        print("\n❌ Agent创建失败，退出测试")
-        return
+    # 3. 转标签流程
+    print("\n--- 测试3: 转Danbooru标签流程 ---")
+    result = agent.process_input("转成Danbooru标签：一个猫娘在咖啡馆")
+    print(f"✓ 标签生成: step={result['step']}, tags数={len(result.get('danbooru_tags', []))}")
 
-    # 测试图片生成
-    print("\n5. 测试图片生成")
-    test_cases = [
-        "画一个银发红瞳的少女在樱花树下",
-        "生成一张科幻风格的图片，太空站",
-    ]
+    # 4. 扩写流程
+    print("\n--- 测试4: 扩写提示词流程 ---")
+    result = agent.process_input("扩写：夕阳下的战舰")
+    print(f"✓ 扩写完成: step={result['step']}")
+    print(f"  扩写内容: {result.get('expanded_prompt', '')[:60]}...")
 
-    for message in test_cases:
-        test_image_generation(agent, message)
+    # 5. 多轮对话（Graph级别）
+    print("\n--- 测试5: Graph 多轮对话 ---")
+    from huesaeagents.huesae.graph.huesae_graph import create_huesae_graph
 
-    print("=" * 60)
-    print("图片 Agent 测试完成")
-    print("=" * 60)
+    graph = create_huesae_graph()
+    config = {"configurable": {"thread_id": "demo_test"}}
 
+    # 第一轮
+    result = graph.invoke(
+        {"messages": [HumanMessage(content="画一个银发红瞳的少女")]},
+        config=config,
+    )
+    print(f"✓ 第一轮: step={result.get('image_step')}")
 
-def test_models():
-    print("=" * 60)
-    print("测试 agents 模块 - Phase1 表情包与语C能力")
-    print("=" * 60)
+    # 第二轮
+    result = graph.invoke(
+        {"messages": [HumanMessage(content="doubao")]},
+        config=config,
+    )
+    print(f"✓ 第二轮: step={result.get('image_step')}, provider={result.get('selected_provider')}")
 
-    # 检查环境变量
-    print("\n0. 检查环境变量")
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
-    if api_key:
-        print(f"   DEEPSEEK_API_KEY: 已设置 (长度={len(api_key)})")
-        print("   ✅ 环境变量检查通过")
-    else:
-        print("   DEEPSEEK_API_KEY: 未设置")
-        print("   ⚠️ 跳过API调用测试")
-
-    # 测试创建 Agent
-    agent = test_create_agent()
-
-    if not agent:
-        print("\n❌ Agent创建失败，退出测试")
-        return
-
-    # 测试情绪检测
-    test_emotion_detection(agent)
-
-    # 测试角色切换
-    test_character_switch(agent)
-
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print("测试完成")
     print("=" * 60)
 
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "image":
-        test_image_agent()
-    else:
-        test_models()
+    run_all_tests()
