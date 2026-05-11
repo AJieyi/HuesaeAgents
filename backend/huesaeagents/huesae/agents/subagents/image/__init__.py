@@ -6,6 +6,7 @@ from .prompts import (
     INTENT_SYSTEM_MESSAGE,
     DANBOORU_SYSTEM_MESSAGE,
     EXPAND_SYSTEM_MESSAGE,
+    IMAGE_CONVERSATION_SYSTEM_MESSAGE,
     get_character_system_message,
 )
 from .providers import ImageProvider, GenerationResult, DoubaoProvider, JimengProvider

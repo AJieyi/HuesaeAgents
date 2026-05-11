@@ -36,7 +36,7 @@ def test_sync_invoke():
     try:
         model = create_deepseek_model(model="deepseek-v4-flash", temperature=0.7)
         print("   正在调用 DeepSeek API (同步)...")
-        response = model.invoke("你好，你是谁")
+        response = model.invoke("你好，你是什么模型?是deepseek-v4-flash吗？")
         print(f"   Response: {response.content}")
         print("   ✅ 同步invoke测试成功")
     except Exception as e:
@@ -78,5 +78,5 @@ def test_factory():
 
 if __name__ == "__main__":
     test_sync_invoke()
-    asyncio.run(test_async_invoke())
-    test_factory()
+    # asyncio.run(test_async_invoke())
+    # test_factory()

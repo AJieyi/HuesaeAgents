@@ -1,8 +1,16 @@
 """意图分类与条件路由
 
-根据用户输入判断意图，并路由到对应的节点。
+主Agent使用LLM做粗分类，将用户路由到对应子Agent。
 支持：对话、生图、语音、记忆、搜索、提醒、安全
+
+关键规则：如果用户已在子图对话中（如生图Agent的多轮对话），
+保持当前意图，避免用户回复被主Agent误分类。
 """
+from typing import Literal
+
+from pydantic import BaseModel, Field
+from langchain_core.messages import HumanMessage
+
 from .state import HuesaeState
 
 
@@ -20,31 +28,7 @@ class Intent:
     SAFE = "safe"           # 安全（高风险内容）
 
 
-# ============== 意图关键词 ==============
-
-INTENT_KEYWORDS = {
-    Intent.IMAGE: [
-        "画", "生成图片", "生成图像", "画图", "绘画", "画一个", "画个",
-        "画一下", "帮我画", "给我画", "生成一张", "画幅", "画张",
-        "image", "generate image", "draw", "paint",
-    ],
-    Intent.VOICE: [
-        "语音", "说话", "声音", "读出来", "念出来", "用语音",
-        "voice", "speak", "audio",
-    ],
-    Intent.MEMORY: [
-        "日记", "记录", "记下来", "今天发生了什么", "回忆", "时间线",
-        "diary", "memory", "record",
-    ],
-    Intent.SEARCH: [
-        "搜索", "查一下", "查找", "查询", "网上", "百度", "谷歌",
-        "search", "look up", "find",
-    ],
-    Intent.REMIND: [
-        "提醒", "定时", "闹钟", "叫我", "记得",
-        "remind", "alarm", "timer",
-    ],
-}
+# ============== 安全关键词（最高优先级，兜底保护） ==============
 
 SAFE_KEYWORDS = [
     "自杀", "自残", "想死", "不想活", "结束生命", "活着没意思",
@@ -52,13 +36,30 @@ SAFE_KEYWORDS = [
 ]
 
 
+# ============== LLM意图分类模型 ==============
+
+class IntentResult(BaseModel):
+    """LLM意图识别结果"""
+
+    intent: Literal[
+        "chat", "image", "voice", "memory", "search", "remind"
+    ] = Field(
+        description="用户意图：chat=普通对话, image=生图/画画/图片相关, "
+                    "voice=语音/声音, memory=记忆/日记/记录, search=搜索/查询, "
+                    "remind=提醒/闹钟/定时"
+    )
+    reason: str = Field(
+        default="",
+        description="判断理由（可选）"
+    )
+
+
 # ============== 意图分类 ==============
 
 def classify_intent(state: HuesaeState) -> str:
     """意图分类
 
-    通过关键词匹配判断用户意图。
-    优先级：安全 > 生图 > 语音 > 记忆 > 搜索 > 提醒 > 对话
+    优先级：安全 > 子图保持 > LLM粗分类
 
     Args:
         state: 当前状态
@@ -70,23 +71,72 @@ def classify_intent(state: HuesaeState) -> str:
     if not messages:
         return Intent.CHAT
 
-    # 获取最后一条用户消息
+    # 获取最后一条用户消息内容
     last_message = messages[-1]
-    content = last_message.content.lower() if hasattr(last_message, "content") else str(last_message).lower()
+    content = (
+        last_message.content.lower()
+        if hasattr(last_message, "content")
+        else str(last_message).lower()
+    )
 
     # 1. 安全检查（最高优先级）
     for keyword in SAFE_KEYWORDS:
         if keyword in content:
             return Intent.SAFE
 
-    # 2. 意图关键词匹配
-    for intent, keywords in INTENT_KEYWORDS.items():
-        for keyword in keywords:
-            if keyword.lower() in content:
-                return intent
+    # 2. 如果已在生图对话中，保持IMAGE意图
+    # 避免用户回复"夕阳下看大海的少女"时被误判为chat
+    image_step = state.get("image_step")
+    if image_step and image_step != "finish":
+        return Intent.IMAGE
 
-    # 3. 默认对话
-    return Intent.CHAT
+    # 3. 用LLM做粗分类
+    return _classify_with_llm(last_message)
+
+
+def _classify_with_llm(last_message) -> str:
+    """使用LLM进行意图粗分类
+
+    只在需要时初始化LLM，避免不必要的开销。
+    如果LLM调用失败，降级到简单规则判断。
+    """
+    from huesaeagents.huesae.models.models_factory import create_chat_model
+
+    user_content = (
+        last_message.content
+        if hasattr(last_message, "content")
+        else str(last_message)
+    )
+
+    prompt = f"""分析以下用户输入的意图，进行分类。
+
+用户输入：{user_content}
+
+分类规则：
+- chat：普通聊天、问候、日常问答（如"你好""今天天气如何"）
+- image：与图片生成、画画、绘图相关的需求（如"画一个...""生成图片""帮我画"）
+- voice：与语音、声音、朗读相关的需求
+- memory：与记忆、日记、记录、回忆相关的需求
+- search：与搜索、查询、查找信息相关的需求
+- remind：与提醒、闹钟、定时、日程相关的需求
+
+请以JSON格式输出结果。"""
+
+    try:
+        llm = create_chat_model("deepseek")
+        structured_llm = llm.with_structured_output(
+            IntentResult,
+            method="json_mode",
+        )
+        result = structured_llm.invoke([HumanMessage(content=prompt)])
+        return result.intent
+    except Exception:
+        # Fallback：简单规则判断
+        content = user_content.lower()
+        image_keywords = ["画", "图", "生成图片", "画画", "绘图", "image", "draw", "paint"]
+        if any(kw in content for kw in image_keywords):
+            return Intent.IMAGE
+        return Intent.CHAT
 
 
 # ============== 条件路由 ==============
@@ -94,7 +144,7 @@ def classify_intent(state: HuesaeState) -> str:
 def route_by_intent(state: HuesaeState) -> str:
     """根据意图路由到对应节点
 
-    用于 LangGraph 的 conditional_edge，根据 intent 字段决定下一个节点。
+    用于 LangGraph 的 conditional_edge。
 
     Args:
         state: 当前状态

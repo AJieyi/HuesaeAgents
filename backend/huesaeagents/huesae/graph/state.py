@@ -24,15 +24,11 @@ class HuesaeState(TypedDict):
     emotion_state: str
     emotion_score: float
 
-    # ---- 生图功能 ----
-    image_step: str | None             # 当前步骤
-    image_mode: str | None             # 当前模式（direct_image/convert_tags/expand_prompt）
-    image_prompt: str | None           # 当前提示词
+    # ---- 生图功能（LLM驱动对话管理） ----
+    image_step: str | None             # 当前步骤：ask_prompt/recommend/ask_confirm/generate/show_image/finish
+    image_prompt: str | None           # 当前确认的提示词
     selected_provider: str | None      # 选择的Provider
-    danbooru_tags: list[str] | None    # 生成的Danbooru标签
-    expanded_prompt: str | None        # 扩写后的提示词
     generated_image_url: str | None    # 生成的图片URL
-    need_more_input: bool              # 是否需要补充输入
 
     # ---- 元信息 ----
     user_id: str | None

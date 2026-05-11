@@ -1,89 +1,61 @@
-"""小生图 Agent（独立类）
+"""生图对话管理器
 
-支持三种模式：
-1. 直接生图：自然语言 → 选择工具(豆包/即梦) → 生图 → 换图/结束
-2. 转Danbooru标签：自然语言 → Danbooru标签 → 换版本/结束
-3. 扩写提示词：简短描述 → 扩写自然语言 → 接受/拒绝
+用LLM驱动对话流程，替代硬编码状态机。
+支持：追问、推荐、扩写、确认、生图、换图
 
-使用 LLM 结构化输出做意图识别和提示词提取。
-
-后续可封装为 LangGraph 节点：
-    def image_agent_node(state: HuesaeState) -> dict:
-        agent = ImageAgent(llm=..., providers=[...])
-        return agent.process_input(user_input)
+核心设计：
+- 每个回合，LLM分析完整对话历史，输出结构化决策（action/response/prompt）
+- 根据action执行对应操作（追问、调用扩写、准备生图等）
+- 实际生图由Graph节点调用异步方法完成
 """
-from typing import TypedDict
+from typing import Literal
 
+from pydantic import BaseModel, Field
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
-from .image import generate_tags, tags_to_prompt, expand_prompt
-from .image.intent import recognize_intent, ImageIntent
+from .image import expand_prompt
 from .image.providers import ImageProvider, GenerationResult
+from .image.prompts import IMAGE_CONVERSATION_SYSTEM_MESSAGE
 
 
-# ============== 模式常量 ==============
+# ============== LLM决策模型 ==============
 
-class ImageMode:
-    """生图功能模式"""
+class ImageDecision(BaseModel):
+    """子图Agent每回合的决策"""
 
-    DIRECT_IMAGE = "direct_image"
-    CONVERT_TAGS = "convert_tags"
-    EXPAND_PROMPT = "expand_prompt"
-    CHAT = "chat"
-
-
-# ============== 步骤常量 ==============
-
-class ImageStep:
-    """生图步骤常量"""
-
-    INPUT = "input"
-    SELECT_TOOL = "select_tool"
-    GENERATE_IMAGE = "generate_image"
-    SHOW_IMAGE = "show_image"
-    GENERATE_TAGS = "generate_tags"
-    SHOW_TAGS = "show_tags"
-    EXPAND_PROMPT = "expand_prompt"
-    SHOW_EXPANDED = "show_expanded"
-    FINISH = "finish"
+    thought: str = Field(description="分析当前对话状态和用户需求")
+    action: Literal[
+        "ask_prompt",       # 追问：缺少提示词，请用户描述
+        "recommend",        # 推荐：主动生成推荐提示词供选择
+        "expand",           # 扩写：将简短描述扩写为详细提示词
+        "ask_confirm",      # 确认：推荐/扩写后询问用户是否满意
+        "generate",         # 生图：调用provider生成图片
+        "show_image",       # 展示：图片已生成，展示给用户
+        "finish",           # 结束：对话完成
+    ] = Field(description="下一步动作")
+    response: str = Field(description="给用户的回复消息，用温柔可爱的二次元语气")
+    prompt: str | None = Field(default=None, description="当前确认的提示词")
+    provider: str | None = Field(default=None, description="选择的生图工具（doubao/jimeng）")
 
 
-# ============== 状态 ==============
+# ============== 对话管理器 ==============
 
-class ImageAgentState(TypedDict):
-    """生图Agent内部状态"""
+class ImageConversationManager:
+    """生图对话管理器
 
-    mode: str
-    step: str
-    user_input: str
-    prompt: str
-    selected_provider: str | None
-    generated_image_url: str | None
-    messages: list
-
-
-# ============== 确认关键词 ==============
-
-CONFIRM_KEYWORDS = ["是", "确认", "确定", "ok", "yes", "可以", "好", "行", "生成", "接受", "就要这版", "可以了"]
-REJECT_KEYWORDS = ["换", "重新", "再来", "不要", "reject", "no", "换一张", "换一版", "再写一版", "换一个", "换一版本"]
-
-
-class ImageAgent:
-    """生图Agent
-
-    使用LLM结构化输出做意图识别和提示词提取。
+    用LLM驱动对话流程，实现"思考-澄清-行动"闭环。
 
     Example:
-        >>> from models.factory import create_chat_model
+        >>> from models.models_factory import create_chat_model
         >>> from agents.subagents.image.providers import DoubaoProvider, JimengProvider
-        >>> agent = ImageAgent(
+        >>> manager = ImageConversationManager(
         ...     llm=create_chat_model("deepseek"),
         ...     providers=[DoubaoProvider(), JimengProvider()]
         ... )
-        >>> result = agent.process_input("画一个银发红瞳的少女")
-        >>> print(result["message"])
-        '检测到您想要生成图片，请输入更详细的提示词（至少5个字）...'
+        >>> result = manager.process({}, "我想生成图片")
+        >>> print(result["messages"][0].content)
+        '请告诉我您想要生成什么样的图片？...'
     """
 
     def __init__(
@@ -103,283 +75,146 @@ class ImageAgent:
         """注册生图Provider（扩展点）"""
         self.providers[provider.name] = provider
 
-    # ============== 意图识别 ==============
-
-    def _recognize(self, user_input: str) -> ImageIntent:
-        """使用LLM识别用户意图"""
-        try:
-            return recognize_intent(user_input, self.llm)
-        except Exception:
-            # 如果结构化输出失败，使用fallback
-            from .image.intent import recognize_intent_simple
-            result = recognize_intent_simple(user_input, self.llm)
-            return ImageIntent(**result)
-
-    # ============== 模式A：直接生图 ==============
-
-    def _handle_direct_image_input(self, prompt: str, intent_result: ImageIntent) -> dict:
-        """处理直接生图模式 - 初始输入"""
-        # 检查是否需要澄清
-        if intent_result.needs_clarification or len(prompt) < 5:
-            return {
-                "step": ImageStep.INPUT,
-                "message": (
-                    f"提示词太短啦，请告诉我更详细的描述（至少5个字）~\n"
-                    f"比如：'一个银发红瞳的少女在樱花树下'"
-                ),
-                "need_more_input": True,
-            }
-
-        # 询问选择工具
-        available = list(self.providers.keys())
-        tool_list = " / ".join(available)
-
-        return {
-            "step": ImageStep.SELECT_TOOL,
-            "mode": ImageMode.DIRECT_IMAGE,
-            "prompt": prompt,
-            "message": (
-                f"想要生成图片：{prompt}\n\n"
-                f"请选择生图工具：{tool_list}\n"
-                f"（输入工具名即可）"
-            ),
-        }
-
-    def _handle_select_tool(self, user_input: str, current_prompt: str) -> dict:
-        """处理工具选择"""
-        content = user_input.lower().strip()
-
-        # 匹配Provider
-        selected = None
-        for name in self.providers.keys():
-            if name.lower() in content:
-                selected = name
-                break
-
-        # 默认使用doubao
-        if selected is None:
-            selected = self.default_provider
-
-        return {
-            "step": ImageStep.GENERATE_IMAGE,
-            "mode": ImageMode.DIRECT_IMAGE,
-            "prompt": current_prompt,
-            "selected_provider": selected,
-            "message": f"好的，使用 {selected} 生成图片：{current_prompt}",
-        }
-
-    def _handle_show_image(self, user_input: str, current_prompt: str) -> dict:
-        """处理图片展示后的用户反馈"""
-        content = user_input.lower().strip()
-
-        # 用户说"换一张" → 用豆包重新生成
-        if any(kw in content for kw in ["换", "重新", "再来", "换一个"]):
-            return {
-                "step": ImageStep.GENERATE_IMAGE,
-                "mode": ImageMode.DIRECT_IMAGE,
-                "prompt": current_prompt,
-                "selected_provider": "doubao",
-                "message": f"好的，用豆包重新生成：{current_prompt}",
-            }
-
-        # 用户说"可以" → 结束
-        return {
-            "step": ImageStep.FINISH,
-            "message": "图片生成完成！如果还想画别的，随时告诉我~",
-        }
-
-    # ============== 模式B：转Danbooru标签 ==============
-
-    def _handle_convert_tags_input(self, prompt: str) -> dict:
-        """处理转Danbooru标签模式 - 初始输入"""
-        if len(prompt) < 2:
-            return {
-                "step": ImageStep.INPUT,
-                "message": "请告诉我你想要转换的内容~",
-                "need_more_input": True,
-            }
-
-        # 生成Danbooru标签
-        tags = generate_tags(prompt, self.llm)
-        tags_str = ", ".join(tags)
-
-        return {
-            "step": ImageStep.SHOW_TAGS,
-            "mode": ImageMode.CONVERT_TAGS,
-            "prompt": prompt,
-            "danbooru_tags": tags,
-            "message": (
-                f"为你生成的Danbooru标签：\n"
-                f"{tags_str}\n\n"
-                f"是否满意？（可以了 / 换一版）"
-            ),
-        }
-
-    def _handle_show_tags(self, user_input: str, current_prompt: str) -> dict:
-        """处理标签展示后的用户反馈"""
-        content = user_input.lower().strip()
-
-        # 用户说"换一版" → 重新生成标签
-        if any(kw in content for kw in ["换", "重新", "再来", "换一个"]):
-            tags = generate_tags(current_prompt, self.llm)
-            tags_str = ", ".join(tags)
-
-            return {
-                "step": ImageStep.SHOW_TAGS,
-                "mode": ImageMode.CONVERT_TAGS,
-                "prompt": current_prompt,
-                "danbooru_tags": tags,
-                "message": (
-                    f"重新生成的Danbooru标签：\n"
-                    f"{tags_str}\n\n"
-                    f"是否满意？（可以了 / 换一版）"
-                ),
-            }
-
-        # 用户说"可以了" → 结束
-        return {
-            "step": ImageStep.FINISH,
-            "message": "标签生成完成！需要生图的话告诉我~",
-        }
-
-    # ============== 模式C：扩写提示词 ==============
-
-    def _handle_expand_prompt_input(self, prompt: str) -> dict:
-        """处理扩写提示词模式 - 初始输入"""
-        if len(prompt) < 2:
-            return {
-                "step": ImageStep.INPUT,
-                "message": "请告诉我你想要扩写的内容~",
-                "need_more_input": True,
-            }
-
-        # 扩写提示词
-        expanded = expand_prompt(prompt, self.llm)
-
-        return {
-            "step": ImageStep.SHOW_EXPANDED,
-            "mode": ImageMode.EXPAND_PROMPT,
-            "prompt": prompt,
-            "expanded_prompt": expanded,
-            "message": (
-                f"扩写后的描述：\n"
-                f"{expanded}\n\n"
-                f"是否接受这版？（接受 / 再写一版）"
-            ),
-        }
-
-    def _handle_show_expanded(self, user_input: str, current_prompt: str) -> dict:
-        """处理扩写展示后的用户反馈"""
-        content = user_input.lower().strip()
-
-        # 用户说"再写一版" → 重新扩写
-        if any(kw in content for kw in ["换", "重新", "再来", "再写"]):
-            expanded = expand_prompt(current_prompt, self.llm)
-
-            return {
-                "step": ImageStep.SHOW_EXPANDED,
-                "mode": ImageMode.EXPAND_PROMPT,
-                "prompt": current_prompt,
-                "expanded_prompt": expanded,
-                "message": (
-                    f"重新扩写的描述：\n"
-                    f"{expanded}\n\n"
-                    f"是否接受这版？（接受 / 再写一版）"
-                ),
-            }
-
-        # 用户说"接受" → 结束
-        return {
-            "step": ImageStep.FINISH,
-            "message": "扩写完成！需要生图或转Danbooru标签的话告诉我~",
-        }
-
     # ============== 主入口 ==============
 
-    def process_input(self, user_input: str) -> dict:
-        """处理用户初始输入
+    def process(self, state: dict, user_input: str) -> dict:
+        """处理用户输入
 
-        使用LLM结构化输出识别意图，进入对应的处理流程。
+        1. LLM决策（分析对话历史 → 决定action）
+        2. 根据action执行对应操作
 
         Args:
-            user_input: 用户输入
+            state: 当前Graph状态（包含messages等）
+            user_input: 用户最新输入
 
         Returns:
-            dict: 包含下一步状态、模式、消息
+            dict: 更新后的状态，包含messages、image_step等
         """
-        # 使用LLM识别意图
-        intent_result = self._recognize(user_input)
+        # 1. LLM决策
+        decision = self._decide(state, user_input)
 
-        # 根据意图分发
-        if intent_result.intent == ImageMode.DIRECT_IMAGE:
-            result = self._handle_direct_image_input(intent_result.extracted_prompt, intent_result)
-        elif intent_result.intent == ImageMode.CONVERT_TAGS:
-            result = self._handle_convert_tags_input(intent_result.extracted_prompt)
-        elif intent_result.intent == ImageMode.EXPAND_PROMPT:
-            result = self._handle_expand_prompt_input(intent_result.extracted_prompt)
-        else:
-            # 普通对话，不处理
+        # 2. 根据action执行
+        if decision.action == "expand":
+            return self._handle_expand(decision, user_input)
+        elif decision.action == "generate":
+            return self._handle_generate(decision)
+        elif decision.action in ("ask_prompt", "recommend", "ask_confirm"):
             return {
-                "mode": ImageMode.CHAT,
-                "step": ImageStep.FINISH,
-                "message": "我是生图Agent，可以帮你生成图片、转Danbooru标签或扩写提示词~",
+                "image_step": decision.action,
+                "image_prompt": decision.prompt,
+                "messages": [AIMessage(content=decision.response)],
+            }
+        elif decision.action == "show_image":
+            return {
+                "image_step": "show_image",
+                "image_prompt": decision.prompt,
+                "messages": [AIMessage(content=decision.response)],
+            }
+        elif decision.action == "finish":
+            return {
+                "image_step": "finish",
+                "messages": [AIMessage(content=decision.response)],
             }
 
-        # 注入公共字段
-        result["mode"] = result.get("mode", intent_result.intent)
-        result["user_input"] = user_input
-        if "need_more_input" not in result:
-            result["need_more_input"] = False
+        # 默认：追问
+        return {
+            "image_step": "ask_prompt",
+            "messages": [AIMessage(content=decision.response)],
+        }
 
-        return result
+    # ============== LLM决策 ==============
 
-    def process_step(self, state: ImageAgentState, user_input: str) -> dict:
-        """处理步骤流转
+    def _decide(self, state: dict, user_input: str) -> ImageDecision:
+        """LLM决策：分析对话历史，决定下一步
 
-        根据当前步骤和模式，处理用户的下一步输入。
-
-        Args:
-            state: 当前Agent状态
-            user_input: 用户输入
-
-        Returns:
-            dict: 更新后的状态
+        构建包含对话历史和当前状态的prompt，调用LLM结构化输出。
         """
-        step = state.get("step", ImageStep.INPUT)
-        mode = state.get("mode", ImageMode.DIRECT_IMAGE)
-        current_prompt = state.get("prompt", "")
+        # 构建对话历史（取最近的消息，避免超出上下文）
+        messages = state.get("messages", [])
+        history_text = self._format_history(messages[-8:])  # 最近8条
+        current_prompt = state.get("image_prompt", "")
+        available_tools = ", ".join(self.providers.keys()) or "doubao, jimeng"
 
-        # 补充输入模式（用户补充了提示词）
-        if step == ImageStep.INPUT and state.get("need_more_input"):
-            new_prompt = user_input.strip()
-            if mode == ImageMode.DIRECT_IMAGE:
-                # 重新识别意图
-                intent_result = self._recognize(new_prompt)
-                return self._handle_direct_image_input(intent_result.extracted_prompt, intent_result)
-            elif mode == ImageMode.CONVERT_TAGS:
-                return self._handle_convert_tags_input(new_prompt)
-            elif mode == ImageMode.EXPAND_PROMPT:
-                return self._handle_expand_prompt_input(new_prompt)
+        user_prompt = f"""请分析当前对话状态，输出下一步决策。
 
-        # 模式A：直接生图
-        if mode == ImageMode.DIRECT_IMAGE:
-            if step == ImageStep.SELECT_TOOL:
-                return self._handle_select_tool(user_input, current_prompt)
-            elif step == ImageStep.SHOW_IMAGE:
-                return self._handle_show_image(user_input, current_prompt)
+当前状态：
+- 用户最新输入：{user_input}
+- 当前已确认的提示词：{current_prompt or "（暂无）"}
+- 可用生图工具：{available_tools}
 
-        # 模式B：转Danbooru标签
-        elif mode == ImageMode.CONVERT_TAGS:
-            if step == ImageStep.SHOW_TAGS:
-                return self._handle_show_tags(user_input, current_prompt)
+最近对话历史：
+{history_text}
 
-        # 模式C：扩写提示词
-        elif mode == ImageMode.EXPAND_PROMPT:
-            if step == ImageStep.SHOW_EXPANDED:
-                return self._handle_show_expanded(user_input, current_prompt)
+请严格遵循system prompt中的工作流程，输出JSON格式决策。"""
 
-        # 默认：重新检测意图
-        return self.process_input(user_input)
+        # 调用LLM
+        try:
+            structured_llm = self.llm.with_structured_output(
+                ImageDecision,
+                method="json_mode",
+            )
+            result = structured_llm.invoke([
+                IMAGE_CONVERSATION_SYSTEM_MESSAGE,
+                HumanMessage(content=user_prompt),
+            ])
+            return result
+        except Exception:
+            # Fallback：任何错误都转为追问
+            return ImageDecision(
+                thought="LLM决策失败，降级到追问",
+                action="ask_prompt",
+                response="抱歉，我刚才没理解清楚~ 请告诉我您想要生成什么样的图片？",
+                prompt=None,
+                provider=None,
+            )
+
+    def _format_history(self, messages: list) -> str:
+        """格式化对话历史为文本"""
+        lines = []
+        for msg in messages:
+            if hasattr(msg, "content") and msg.content:
+                role = "用户" if getattr(msg, "type", "") == "human" else "AI"
+                lines.append(f"{role}：{msg.content}")
+        return "\n".join(lines) if lines else "（无历史对话）"
+
+    # ============== Action处理 ==============
+
+    def _handle_expand(self, decision: ImageDecision, user_input: str) -> dict:
+        """处理扩写：调用expand_prompt，返回确认状态"""
+        prompt_to_expand = decision.prompt or user_input
+        expanded = expand_prompt(prompt_to_expand, self.llm)
+
+        return {
+            "image_step": "ask_confirm",
+            "image_prompt": prompt_to_expand,
+            "expanded_prompt": expanded,
+            "messages": [
+                AIMessage(
+                    content=(
+                        f"扩写后的描述：\n"
+                        f"{expanded}\n\n"
+                        f"这个描述可以吗？需要修改哪里吗？"
+                    )
+                )
+            ],
+        }
+
+    def _handle_generate(self, decision: ImageDecision) -> dict:
+        """处理生图决策
+
+        不实际调用provider（异步操作由Graph节点执行），
+        只返回generate状态和相关参数。
+        """
+        return {
+            "image_step": "generate",
+            "image_prompt": decision.prompt,
+            "selected_provider": decision.provider or self.default_provider,
+            "messages": [
+                AIMessage(
+                    content=decision.response or "图片正在生成中，请稍等~"
+                )
+            ],
+        }
 
     # ============== 生图执行 ==============
 
@@ -421,7 +256,7 @@ class ImageAgent:
 def create_image_agent(
     llm: BaseChatModel | None = None,
     providers: list[ImageProvider] | None = None,
-) -> ImageAgent:
+) -> ImageConversationManager:
     """创建生图Agent工厂函数
 
     Args:
@@ -429,7 +264,7 @@ def create_image_agent(
         providers: Provider列表，默认包含Doubao和Jimeng
 
     Returns:
-        ImageAgent: 生图Agent实例
+        ImageConversationManager: 生图对话管理器实例
     """
     if llm is None:
         try:
@@ -442,4 +277,4 @@ def create_image_agent(
         from .image.providers import DoubaoProvider, JimengProvider
         providers = [DoubaoProvider(), JimengProvider()]
 
-    return ImageAgent(llm=llm, providers=providers)
+    return ImageConversationManager(llm=llm, providers=providers)

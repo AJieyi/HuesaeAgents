@@ -16,12 +16,12 @@ LangGraph 状态图，编排所有智能体节点。
 多轮对话使用方式：
     # 第一次调用
     result = graph.invoke(
-        {"messages": [{"role": "user", "content": "画一个银发红瞳的少女"}]},
+        {"messages": [{"role": "user", "content": "我想生成图片"}]},
         config={"configurable": {"thread_id": "user_123"}}
     )
     # 第二次调用（自动恢复状态）
     result = graph.invoke(
-        {"messages": [{"role": "user", "content": "doubao"}]},
+        {"messages": [{"role": "user", "content": "夕阳下看大海的少女"}]},
         config={"configurable": {"thread_id": "user_123"}}
     )
 """
@@ -49,7 +49,7 @@ def input_node(state: HuesaeState) -> dict:
 
 
 def classify_intent_node(state: HuesaeState) -> dict:
-    """意图分类节点"""
+    """意图分类节点（LLM驱动）"""
     intent = classify_intent(state)
     return {"intent": intent}
 
@@ -64,170 +64,70 @@ def chat_agent_node(state: HuesaeState) -> dict:
 def image_agent_node(state: HuesaeState) -> dict:
     """生图智能体节点
 
-    支持三种模式的多轮交互：
-    1. 直接生图：选择工具 → 生图 → 换图/结束
-    2. 转Danbooru标签：生成标签 → 换版本/结束
-    3. 扩写提示词：扩写 → 接受/拒绝
+    使用LLM驱动的对话管理器，支持多轮对话：
+    - 追问：用户没提供提示词时主动询问
+    - 推荐：用户要求推荐时主动生成建议
+    - 扩写：用户描述太短时帮助扩写
+    - 确认：推荐/扩写后询问用户是否满意
+    - 生图：用户确认后调用Provider生成图片
+    - 换图：用户不满意时重新生成
 
     多轮状态通过 checkpoint 保存和恢复。
     """
     import asyncio
-    from ..agents.subagents.image_agent import ImageAgent, ImageMode, ImageStep
-    from ..agents.subagents.image.providers import DoubaoProvider, JimengProvider
+    from ..agents.subagents.image_agent import create_image_agent
     from ..models.models_factory import create_chat_model
 
-    # 初始化Agent
+    # 初始化对话管理器
     llm = create_chat_model("deepseek")
-    agent = ImageAgent(
-        llm=llm,
-        providers=[DoubaoProvider(), JimengProvider()],
-    )
-
-    # 获取当前状态
-    image_step = state.get("image_step")
-    image_mode = state.get("image_mode")
-    messages = state.get("messages", [])
+    manager = create_image_agent(llm=llm)
 
     # 获取最后一条用户消息
     last_user_msg = ""
+    messages = state.get("messages", [])
     for msg in reversed(messages):
-        if isinstance(msg, HumanMessage) or (isinstance(msg, dict) and msg.get("role") == "user"):
-            last_user_msg = msg.content if hasattr(msg, "content") else msg.get("content", "")
+        if isinstance(msg, HumanMessage) or (
+            isinstance(msg, dict) and msg.get("role") == "user"
+        ):
+            last_user_msg = (
+                msg.content if hasattr(msg, "content") else msg.get("content", "")
+            )
             break
 
-    # ========== 首次进入：没有生图状态 ==========
-    if image_step is None:
-        result = agent.process_input(last_user_msg)
+    # 交给对话管理器处理
+    result = manager.process(state, last_user_msg)
 
-        return {
-            "image_step": result.get("step", "input"),
-            "image_mode": result.get("mode", "direct_image"),
-            "image_prompt": result.get("prompt", ""),
-            "need_more_input": result.get("need_more_input", False),
-            "messages": [AIMessage(content=result["message"])],
-        }
-
-    # ========== 需要补充输入（提示词太短） ==========
-    if image_step == ImageStep.INPUT and state.get("need_more_input"):
-        temp_state = {
-            "step": image_step,
-            "mode": image_mode,
-            "prompt": state.get("image_prompt", ""),
-            "need_more_input": True,
-        }
-        result = agent.process_step(temp_state, last_user_msg)
-
-        return {
-            "image_step": result.get("step", "input"),
-            "image_mode": result.get("mode", image_mode),
-            "image_prompt": result.get("prompt", state.get("image_prompt", "")),
-            "danbooru_tags": result.get("danbooru_tags"),
-            "expanded_prompt": result.get("expanded_prompt"),
-            "need_more_input": result.get("need_more_input", False),
-            "messages": [AIMessage(content=result["message"])],
-        }
-
-    # ========== 选择工具、确认标签、确认扩写 ==========
-    if image_step in [ImageStep.SELECT_TOOL, ImageStep.SHOW_TAGS, ImageStep.SHOW_EXPANDED]:
-        temp_state = {
-            "step": image_step,
-            "mode": image_mode,
-            "prompt": state.get("image_prompt", ""),
-            "danbooru_tags": state.get("danbooru_tags"),
-            "expanded_prompt": state.get("expanded_prompt"),
-        }
-        result = agent.process_step(temp_state, last_user_msg)
-
-        updates = {
-            "image_step": result.get("step", "finish"),
-            "image_mode": result.get("mode", image_mode),
-            "image_prompt": result.get("prompt", state.get("image_prompt", "")),
-            "selected_provider": result.get("selected_provider"),
-            "messages": [AIMessage(content=result["message"])],
-        }
-
-        if "danbooru_tags" in result:
-            updates["danbooru_tags"] = result["danbooru_tags"]
-        if "expanded_prompt" in result:
-            updates["expanded_prompt"] = result["expanded_prompt"]
-        if "need_more_input" in result:
-            updates["need_more_input"] = result["need_more_input"]
-
-        return updates
-
-    # ========== 生成图片 ==========
-    if image_step == ImageStep.GENERATE_IMAGE:
-        prompt = state.get("image_prompt", "")
-        provider = state.get("selected_provider", "doubao")
+    # 如果决策是生图，执行异步生图
+    if result.get("image_step") == "generate":
+        prompt = result.get("image_prompt", "")
+        provider = result.get("selected_provider", "doubao")
 
         try:
-            generation = asyncio.run(agent.generate_image(prompt, provider))
+            generation = asyncio.run(manager.generate_image(prompt, provider))
 
             return {
-                "image_step": ImageStep.SHOW_IMAGE,
+                "image_step": "show_image",
                 "generated_image_url": generation.url,
                 "messages": [
                     AIMessage(
                         content=(
+                            f"{result['messages'][0].content}\n\n"
                             f"图片生成完成！\n\n"
                             f"工具：{provider}\n"
                             f"提示词：{prompt}\n\n"
                             f"{generation.url}\n\n"
-                            f"是否换一张？（换一张 / 可以）"
+                            f"是否满意？不满意的话我可以重新生成哦~"
                         )
                     )
                 ],
             }
         except Exception as e:
             return {
-                "image_step": ImageStep.FINISH,
+                "image_step": "finish",
                 "messages": [AIMessage(content=f"图片生成失败：{str(e)}")],
             }
 
-    # ========== 展示图片后，用户回复 ==========
-    if image_step == ImageStep.SHOW_IMAGE:
-        temp_state = {
-            "step": ImageStep.SHOW_IMAGE,
-            "mode": ImageMode.DIRECT_IMAGE,
-            "prompt": state.get("image_prompt", ""),
-        }
-        result = agent.process_step(temp_state, last_user_msg)
-
-        # 如果用户要换图，重新生成
-        if result.get("step") == ImageStep.GENERATE_IMAGE:
-            provider = result.get("selected_provider", "doubao")
-            current_prompt = state.get("image_prompt", "")
-            try:
-                generation = asyncio.run(agent.generate_image(current_prompt, provider))
-                return {
-                    "image_step": ImageStep.SHOW_IMAGE,
-                    "generated_image_url": generation.url,
-                    "messages": [
-                        AIMessage(
-                            content=(
-                                f"重新生成完成！\n\n"
-                                f"工具：{provider}\n"
-                                f"提示词：{current_prompt}\n\n"
-                                f"{generation.url}\n\n"
-                                f"是否换一张？（换一张 / 可以）"
-                            )
-                        )
-                    ],
-                }
-            except Exception as e:
-                return {
-                    "image_step": ImageStep.FINISH,
-                    "messages": [AIMessage(content=f"图片生成失败：{str(e)}")],
-                }
-
-        # 结束
-        return {
-            "image_step": ImageStep.FINISH,
-            "messages": [AIMessage(content=result["message"])],
-        }
-
-    # ========== 默认结束 ==========
-    return {"image_step": ImageStep.FINISH}
+    return result
 
 
 def voice_agent_node(state: HuesaeState) -> dict:
@@ -296,14 +196,14 @@ def create_huesae_graph(checkpointer: Any = None) -> StateGraph:
         >>>
         >>> # 第一轮：用户输入
         >>> result = graph.invoke(
-        ...     {"messages": [{"role": "user", "content": "画一个银发红瞳的少女"}]},
+        ...     {"messages": [{"role": "user", "content": "我想生成图片"}]},
         ...     config=config
         ... )
         >>> print(result["messages"][-1].content)  # Agent回复
         >>>
-        >>> # 第二轮：用户选择工具（自动恢复状态）
+        >>> # 第二轮：用户提供提示词（自动恢复状态）
         >>> result = graph.invoke(
-        ...     {"messages": [{"role": "user", "content": "doubao"}]},
+        ...     {"messages": [{"role": "user", "content": "夕阳下看大海的少女"}]},
         ...     config=config
         ... )
     """
