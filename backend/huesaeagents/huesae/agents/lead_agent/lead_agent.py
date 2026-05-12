@@ -1,4 +1,4 @@
-"""主Agent
+"""主Agent（Lead Agent）
 
 对话核心，负责：
 1. 意图分类（LLM驱动，基于完整对话历史）
@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
-from .subagents.base import BaseSubAgent
+from ..subagents.base import BaseSubAgent
 
 
 # ============== 意图常量 ==============
@@ -51,27 +51,6 @@ class IntentResult(BaseModel):
                     "remind=提醒/闹钟/定时"
     )
     reason: str = Field(default="", description="判断理由")
-
-
-# ============== 生图风格辅助 ==============
-
-_REALISTIC_KEYWORDS = ["真人", "写实", "照片", "realistic", "real person", "photograph", "photorealistic"]
-_ANIME_KEYWORDS = ["动漫", "二次元", "anime", "cartoon", "manga"]
-
-
-def _is_realistic_request(prompt: str) -> bool:
-    """检查用户是否明确要求真人/写实风格"""
-    prompt_lower = prompt.lower()
-    return any(kw in prompt_lower for kw in _REALISTIC_KEYWORDS)
-
-
-def _ensure_anime_style(prompt: str) -> str:
-    """默认添加动漫风格前缀（除非用户明确要求真人风格或已包含动漫关键词）"""
-    if _is_realistic_request(prompt):
-        return prompt
-    if any(kw in prompt for kw in _ANIME_KEYWORDS):
-        return prompt
-    return f"二次元动漫风格，{prompt}"
 
 
 # ============== 主Agent ==============
@@ -116,7 +95,7 @@ class HuesaeMainAgent:
             user_input: 用户最新输入
 
         Returns:
-            dict: 包含 messages 列表，可选 image_url
+            dict: 包含 messages 列表，可选 image_url/image_goal/clear_image_goal
         """
         # 1. 安全检查（最高优先级）
         if self._check_safety(user_input):
@@ -131,11 +110,19 @@ class HuesaeMainAgent:
 
         # 3. 如果意图匹配子Agent，调用子Agent
         if intent in self.sub_agents:
+            # 复制 state，避免修改外部传入的原始对象
+            state = dict(state)
+            if "image_goal" not in state:
+                state["image_goal"] = self._classify_image_goal(user_input)
             return self._handle_sub_agent(intent, state, user_input)
 
         # 4. 否则主Agent直接聊天回复
         chat_response = self._chat_reply(state, user_input)
-        return {"messages": [AIMessage(content=chat_response)]}
+        result = {"messages": [AIMessage(content=chat_response)]}
+        # 如果之前有 image_goal，现在切回聊天，通知调用者清除
+        if "image_goal" in state:
+            result["clear_image_goal"] = True
+        return result
 
     # ============== 意图分类 ==============
 
@@ -158,8 +145,8 @@ class HuesaeMainAgent:
 
 分类规则：
 - chat：普通聊天、问候、日常问答（如"你好""今天天气如何""真好看""谢谢"）
-- image：与图片生成、画画、绘图相关的需求（如"画一个...""生成图片""帮我画"）
-  - 如果对话历史中用户之前说过"我想生成图片"等，且当前输入是描述性的（如"夕阳下看大海的少女"），也属于 image
+- image：与图片生成、画画、绘图、扩写、标签相关的需求
+  - 如果对话历史中用户之前说过"我想生成图片"等，且当前输入是描述性的，也属于 image
   - 但如果用户说"真好看""谢谢""换个话题"等，属于 chat
 - voice：与语音、声音、朗读相关的需求
 - memory：与记忆、日记、记录、回忆相关的需求
@@ -178,10 +165,25 @@ class HuesaeMainAgent:
         except Exception:
             # Fallback：简单规则判断
             content = user_input.lower()
-            image_keywords = ["画", "图", "生成图片", "画画", "绘图", "image", "draw", "paint"]
+            image_keywords = ["画", "图", "生成图片", "画画", "绘图", "image", "draw", "paint", "扩写", "扩展", "标签", "danbooru"]
             if any(kw in content for kw in image_keywords):
                 return Intent.IMAGE
             return Intent.CHAT
+
+    def _classify_image_goal(self, user_input: str) -> str:
+        """识别 image 意图下的具体目标
+
+        Returns:
+            generate_image: 用户想要生成图片
+            expand_prompt: 用户只想要扩写提示词
+            convert_tags: 用户想要转成Danbooru标签
+        """
+        content = user_input.lower()
+        if any(kw in content for kw in ["扩写", "扩展", "丰富", "expand", "扩一下", "写详细"]):
+            return "expand_prompt"
+        if any(kw in content for kw in ["标签", "danbooru", "tag", "转成标签", "转标签"]):
+            return "convert_tags"
+        return "generate_image"
 
     def _format_history(self, messages: list) -> str:
         """格式化对话历史为文本"""
@@ -200,34 +202,78 @@ class HuesaeMainAgent:
         sub_result = agent.process(state, user_input)
 
         action = sub_result.get("action", "")
+        image_goal = state.get("image_goal", "generate_image")
 
         # 子Agent返回的是"生图流程中的一步"（追问/推荐/确认）
         if action in ("ask_prompt", "recommend", "ask_confirm"):
-            return {"messages": [AIMessage(content=sub_result["response"])]}
+            # 如果是第一次进入生图流程，主Agent添加过渡语
+            if not self._has_image_context(state):
+                transition = self._create_transition_message(intent)
+                return {
+                    "messages": [
+                        AIMessage(content=transition),
+                        AIMessage(content=sub_result["response"]),
+                    ],
+                    "image_goal": image_goal,
+                }
+            return {
+                "messages": [AIMessage(content=sub_result["response"])],
+                "image_goal": image_goal,
+            }
 
         # 子Agent返回的是"执行生图"
         if action == "generate":
-            return self._handle_generate_image(agent, sub_result)
+            result = self._handle_generate_image(agent, sub_result)
+            result["clear_image_goal"] = True
+            return result
 
         # 子Agent返回结束
         if action == "finish":
-            # 主Agent用角色语气回复结束语
-            chat_response = self._chat_reply(state, user_input)
-            return {"messages": [AIMessage(content=chat_response)]}
+            if image_goal == "generate_image":
+                # 生图意图：用主Agent角色语气回复结束语
+                chat_response = self._chat_reply(state, user_input)
+                return {
+                    "messages": [AIMessage(content=chat_response)],
+                    "clear_image_goal": True,
+                }
+            else:
+                # 扩写/标签意图：直接返回子Agent的响应（已包含扩写/标签结果）
+                return {
+                    "messages": [AIMessage(content=sub_result["response"])],
+                    "clear_image_goal": True,
+                }
 
         # 默认：直接展示子Agent的回复
-        return {"messages": [AIMessage(content=sub_result["response"])]}
+        return {
+            "messages": [AIMessage(content=sub_result["response"])],
+            "image_goal": image_goal,
+        }
+
+    def _has_image_context(self, state: dict) -> bool:
+        """检查对话历史中是否已有生图相关上下文"""
+        messages = state.get("messages", [])
+        for msg in messages:
+            if hasattr(msg, "type") and getattr(msg, "type", "") == "ai":
+                content = getattr(msg, "content", "")
+                if any(kw in content for kw in ["图片", "生成", "扩写", "描述", "推荐", "提示词"]):
+                    return True
+        return False
+
+    def _create_transition_message(self, intent: str) -> str:
+        """生成委派给子Agent时的过渡语"""
+        if intent == Intent.IMAGE:
+            return "好的，我来帮您~"
+        return "好的~"
 
     def _handle_generate_image(self, agent: BaseSubAgent, sub_result: dict) -> dict:
         """执行生图并包装展示"""
         import asyncio
 
         prompt = sub_result.get("prompt", "")
-        final_prompt = _ensure_anime_style(prompt)
 
-        # 调用生图
+        # 调用生图（风格处理由子Agent内部完成）
         try:
-            generation = asyncio.run(agent.generate_image(final_prompt))
+            generation = asyncio.run(agent.generate_image(prompt))
 
             # 主Agent包装语
             wrap_msg = self._create_wrap_message()
@@ -246,7 +292,7 @@ class HuesaeMainAgent:
 
     def _create_wrap_message(self) -> str:
         """用主Agent的角色语气生成图片展示语"""
-        from .subagents.image.prompts import get_character_system_message
+        from ..subagents.image.prompts import get_character_system_message
 
         character_msg = get_character_system_message(self.character_id)
         wrap_prompt = (
@@ -262,7 +308,7 @@ class HuesaeMainAgent:
 
     def _chat_reply(self, state: dict, user_input: str) -> str:
         """主Agent直接聊天回复"""
-        from .subagents.image.prompts import get_character_system_message
+        from ..subagents.image.prompts import get_character_system_message
 
         character_msg = get_character_system_message(self.character_id)
         messages = [character_msg] + state.get("messages", []) + [HumanMessage(content=user_input)]

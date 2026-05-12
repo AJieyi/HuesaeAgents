@@ -2,7 +2,7 @@
 
 LangChain + 主智能体委派架构。
 """
-from .main_agent import HuesaeMainAgent, create_main_agent, Intent
+from .lead_agent import HuesaeMainAgent, create_main_agent, Intent, run_chat_loop
 from .subagents.base import BaseSubAgent
 from .subagents.image_agent import ImageSubAgent, ImageDecision, create_image_agent
 
@@ -10,6 +10,7 @@ __all__ = [
     "HuesaeMainAgent",
     "create_main_agent",
     "Intent",
+    "run_chat_loop",
     "BaseSubAgent",
     "ImageSubAgent",
     "ImageDecision",

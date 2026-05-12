@@ -16,7 +16,7 @@ if str(backend_dir) not in sys.path:
 import pytest
 from langchain_core.messages import HumanMessage, AIMessage
 
-from huesaeagents.huesae.agents.main_agent import HuesaeMainAgent, Intent
+from huesaeagents.huesae.agents.lead_agent import HuesaeMainAgent, Intent
 from huesaeagents.huesae.agents.subagents.image_agent import (
     ImageSubAgent,
     ImageDecision,
