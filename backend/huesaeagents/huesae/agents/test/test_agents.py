@@ -1,10 +1,9 @@
 """Agent 测试
 
 测试内容：
-1. 主图意图识别（LLM粗分类 + 子图保持）
-2. 子图对话管理器（追问、推荐、扩写、确认、生图）
-3. Graph多轮对话流程
-4. Provider注册
+1. 主Agent意图分类（LLM + 对话历史上下文）
+2. 子Agent标准化接口（追问、推荐、扩写、确认、生图）
+3. 主Agent集成测试（聊天、委派子Agent、包装展示）
 """
 import sys
 from pathlib import Path
@@ -17,8 +16,9 @@ if str(backend_dir) not in sys.path:
 import pytest
 from langchain_core.messages import HumanMessage, AIMessage
 
+from huesaeagents.huesae.agents.main_agent import HuesaeMainAgent, Intent
 from huesaeagents.huesae.agents.subagents.image_agent import (
-    ImageConversationManager,
+    ImageSubAgent,
     ImageDecision,
     create_image_agent,
 )
@@ -26,14 +26,8 @@ from huesaeagents.huesae.agents.subagents.image import (
     generate_tags,
     expand_prompt,
     DoubaoProvider,
-    JimengProvider,
 )
 from huesaeagents.huesae.models.models_factory import create_chat_model
-from huesaeagents.huesae.graph.conditional_logic import (
-    classify_intent,
-    route_by_intent,
-    Intent,
-)
 
 
 # ============== 夹具 ==============
@@ -45,67 +39,79 @@ def llm():
 
 
 @pytest.fixture(scope="module")
-def image_manager(llm):
-    """共享的ImageConversationManager实例（不调用实际API）"""
-    return ImageConversationManager(llm=llm, providers=[])
+def main_agent(llm):
+    """共享的主Agent实例"""
+    agent = HuesaeMainAgent(llm=llm)
+    agent.register_sub_agent(create_image_agent(llm=llm))
+    return agent
 
 
-# ============== 测试：主图意图识别 ==============
+@pytest.fixture(scope="module")
+def image_agent(llm):
+    """共享的ImageSubAgent实例（不调用实际API）"""
+    return ImageSubAgent(llm=llm, providers=[])
 
-class TestIntentRecognition:
-    """测试主图LLM粗分类意图识别"""
 
-    def test_classify_image_intent(self):
+# ============== 测试：主Agent意图分类 ==============
+
+class TestMainAgentIntent:
+    """测试主Agent的意图分类"""
+
+    def test_classify_image_intent(self, main_agent):
         """测试识别生图意图"""
-        state = {
-            "messages": [HumanMessage(content="我想生成图片")],
-            "image_step": None,
-        }
-        result = classify_intent(state)
-        assert result == Intent.IMAGE
-        print(f"意图识别: {result}")
+        state = {"messages": []}
+        intent = main_agent._classify_intent(state, "我想生成图片")
+        assert intent == Intent.IMAGE
+        print(f"意图识别: {intent}")
 
-    def test_classify_chat_intent(self):
+    def test_classify_chat_intent(self, main_agent):
         """测试识别普通对话意图"""
+        state = {"messages": []}
+        intent = main_agent._classify_intent(state, "今天天气怎么样？")
+        assert intent == Intent.CHAT
+        print(f"意图识别: {intent}")
+
+    def test_classify_chat_after_image(self, main_agent):
+        """测试：生图完成后，用户说无关内容，应分类为chat"""
         state = {
-            "messages": [HumanMessage(content="今天天气怎么样？")],
-            "image_step": None,
+            "messages": [
+                HumanMessage(content="我想生成图片"),
+                AIMessage(content="请告诉我您想要生成什么样的图片？"),
+                HumanMessage(content="夕阳下看大海的少女"),
+                AIMessage(content="图片已生成完成"),
+            ],
         }
-        result = classify_intent(state)
-        assert result == Intent.CHAT
-        print(f"意图识别: {result}")
+        intent = main_agent._classify_intent(state, "真好看")
+        assert intent == Intent.CHAT
+        print(f"生图后切回聊天: {intent}")
 
-    def test_keep_image_intent_in_conversation(self):
-        """测试子图对话中保持IMAGE意图"""
+    def test_keep_image_intent_in_conversation(self, main_agent):
+        """测试：生图对话中，用户继续提供描述，保持IMAGE意图"""
         state = {
-            "messages": [HumanMessage(content="夕阳下看大海的少女")],
-            "image_step": "ask_prompt",
+            "messages": [
+                HumanMessage(content="我想生成图片"),
+                AIMessage(content="请告诉我您想要生成什么样的图片？"),
+            ],
         }
-        result = classify_intent(state)
-        assert result == Intent.IMAGE
-        print(f"子图保持: {result}")
-
-    def test_route_by_intent(self):
-        """测试条件路由"""
-        assert route_by_intent({"intent": Intent.CHAT}) == "chat_agent"
-        assert route_by_intent({"intent": Intent.IMAGE}) == "image_agent"
-        assert route_by_intent({"intent": Intent.VOICE}) == "voice_agent"
+        intent = main_agent._classify_intent(state, "夕阳下看大海的少女")
+        assert intent == Intent.IMAGE
+        print(f"生图对话中保持: {intent}")
 
 
-# ============== 测试：子图对话管理器 ==============
+# ============== 测试：子Agent标准化接口 ==============
 
-class TestImageConversationManager:
-    """测试 ImageConversationManager 对话流程"""
+class TestImageSubAgent:
+    """测试 ImageSubAgent 标准化接口"""
 
-    def test_ask_prompt_when_no_description(self, image_manager):
+    def test_ask_prompt_when_no_description(self, image_agent):
         """测试：用户只说'我想生成图片'，应该追问"""
-        result = image_manager.process({}, "我想生成图片")
+        result = image_agent.process({}, "我想生成图片")
 
-        assert result["image_step"] == "ask_prompt"
-        assert "请告诉我" in result["messages"][0].content or "描述" in result["messages"][0].content
-        print(f"追问: {result['messages'][0].content}")
+        assert result["action"] == "ask_prompt"
+        assert "请告诉我" in result["response"] or "描述" in result["response"]
+        print(f"追问: {result['response']}")
 
-    def test_generate_when_has_prompt(self, image_manager):
+    def test_generate_when_has_prompt(self, image_agent):
         """测试：用户提供了明确提示词"""
         state = {
             "messages": [
@@ -114,13 +120,13 @@ class TestImageConversationManager:
                 HumanMessage(content="夕阳下看大海的少女，穿着水手服"),
             ],
         }
-        result = image_manager.process(state, "夕阳下看大海的少女，穿着水手服")
+        result = image_agent.process(state, "夕阳下看大海的少女，穿着水手服")
 
         # 应该进入generate或ask_confirm
-        assert result["image_step"] in ("generate", "ask_confirm")
-        print(f"有提示词: step={result['image_step']}, prompt={result.get('image_prompt')}")
+        assert result["action"] in ("generate", "ask_confirm")
+        print(f"有提示词: action={result['action']}, prompt={result.get('prompt')}")
 
-    def test_recommend_when_asked(self, image_manager):
+    def test_recommend_when_asked(self, image_agent):
         """测试：用户要求推荐"""
         state = {
             "messages": [
@@ -129,27 +135,41 @@ class TestImageConversationManager:
                 HumanMessage(content="你帮我推荐一些吧"),
             ],
         }
-        result = image_manager.process(state, "你帮我推荐一些吧")
+        result = image_agent.process(state, "你帮我推荐一些吧")
 
-        assert result["image_step"] == "recommend"
-        print(f"推荐: {result['messages'][0].content[:60]}...")
+        assert result["action"] == "recommend"
+        print(f"推荐: {result['response'][:60]}...")
 
-    def test_expand_when_asked(self, image_manager):
+    def test_expand_when_asked(self, image_agent):
         """测试：用户要求扩写"""
         state = {
             "messages": [HumanMessage(content="夏天的图")],
             "image_prompt": "夏天的图",
         }
-        result = image_manager.process(state, "你帮我扩展一下吧")
+        result = image_agent.process(state, "你帮我扩展一下吧")
 
         # 扩写后进入ask_confirm
-        assert result["image_step"] == "ask_confirm"
-        assert "扩写" in result["messages"][0].content
-        print(f"扩写: {result['messages'][0].content[:60]}...")
+        assert result["action"] == "ask_confirm"
+        assert "扩写" in result["response"]
+        print(f"扩写: {result['response'][:60]}...")
 
-    def test_decide_structured_output(self, image_manager):
+    def test_finish_when_satisfied(self, image_agent):
+        """测试：用户满意后，子Agent返回finish"""
+        state = {
+            "messages": [
+                HumanMessage(content="我想生成图片"),
+                AIMessage(content="图片已生成完成，您满意吗？"),
+            ],
+        }
+        result = image_agent.process(state, "真好看，谢谢")
+
+        # 应该返回finish（子Agent认为对话结束）
+        assert result["action"] == "finish"
+        print(f"结束: {result['response'][:60]}...")
+
+    def test_decide_structured_output(self, image_agent):
         """测试：LLM决策结构化输出"""
-        decision = image_manager._decide({}, "画一个猫娘")
+        decision = image_agent._decide({}, "画一个猫娘")
 
         assert isinstance(decision, ImageDecision)
         assert decision.action in (
@@ -159,72 +179,54 @@ class TestImageConversationManager:
         assert decision.response is not None
         print(f"决策: action={decision.action}, prompt={decision.prompt}")
 
+    def test_standardized_result_format(self, image_agent):
+        """测试：返回结果符合标准化格式"""
+        result = image_agent.process({}, "我想生成图片")
 
-# ============== 测试：Graph 多轮对话 ==============
+        assert "action" in result
+        assert "response" in result
+        assert "prompt" in result
+        assert "provider" in result
+        assert "data" in result
+        print(f"标准化结果: {list(result.keys())}")
 
-class TestGraphMultiTurn:
-    """测试 Graph 级别的多轮对话"""
 
-    def test_graph_first_turn_ask_prompt(self):
-        """测试 Graph 第一轮：用户说'我想生成图片'→应该追问"""
-        from huesaeagents.huesae.graph.huesae_graph import create_huesae_graph
+# ============== 测试：主Agent集成 ==============
 
-        graph = create_huesae_graph()
-        config = {"configurable": {"thread_id": "test_user_1"}}
+class TestMainAgentIntegration:
+    """测试主Agent集成（聊天 + 委派子Agent）"""
 
-        result = graph.invoke(
-            {"messages": [HumanMessage(content="我想生成图片")]},
-            config=config,
-        )
+    def test_chat_directly(self, main_agent):
+        """测试：主Agent直接聊天回复"""
+        result = main_agent.process({"messages": []}, "你好")
 
-        assert result.get("image_step") == "ask_prompt"
-        ai_msg = result["messages"][-1]
-        assert "请告诉我" in ai_msg.content or "描述" in ai_msg.content
-        print(f"Graph第一轮: {ai_msg.content[:60]}...")
+        assert len(result["messages"]) == 1
+        assert isinstance(result["messages"][0], AIMessage)
+        print(f"聊天回复: {result['messages'][0].content[:60]}...")
 
-    def test_graph_second_turn_generate(self):
-        """测试 Graph 第二轮：用户提供提示词"""
-        from huesaeagents.huesae.graph.huesae_graph import create_huesae_graph
+    def test_delegate_to_image_agent(self, main_agent):
+        """测试：主Agent委派给生图Agent"""
+        result = main_agent.process({"messages": []}, "我想生成图片")
 
-        graph = create_huesae_graph()
-        config = {"configurable": {"thread_id": "test_user_2"}}
+        # 应该返回子Agent的追问
+        assert len(result["messages"]) == 1
+        assert "请告诉我" in result["messages"][0].content or "描述" in result["messages"][0].content
+        print(f"委派生图: {result['messages'][0].content[:60]}...")
 
-        # 第一轮
-        graph.invoke(
-            {"messages": [HumanMessage(content="我想生成图片")]},
-            config=config,
-        )
+    def test_chat_after_image_context(self, main_agent):
+        """测试：生图对话历史存在时，用户说无关内容，主Agent直接聊天"""
+        messages = [
+            HumanMessage(content="我想生成图片"),
+            AIMessage(content="请告诉我您想要生成什么样的图片？"),
+            HumanMessage(content="夕阳下看大海的少女"),
+            AIMessage(content="图片已生成完成"),
+        ]
+        result = main_agent.process({"messages": messages}, "真好看")
 
-        # 第二轮：提供提示词
-        result = graph.invoke(
-            {"messages": [HumanMessage(content="夕阳下看大海的少女，穿着水手服")]},
-            config=config,
-        )
-
-        assert result.get("image_step") in ("generate", "ask_confirm")
-        print(f"Graph第二轮: step={result.get('image_step')}")
-
-    def test_graph_keep_intent_in_conversation(self):
-        """测试：子图对话中，主图保持IMAGE意图"""
-        from huesaeagents.huesae.graph.huesae_graph import create_huesae_graph
-
-        graph = create_huesae_graph()
-        config = {"configurable": {"thread_id": "test_user_3"}}
-
-        # 第一轮：进入生图
-        graph.invoke(
-            {"messages": [HumanMessage(content="我想生成图片")]},
-            config=config,
-        )
-
-        # 第二轮：提供一个没有生图关键词的描述
-        result = graph.invoke(
-            {"messages": [HumanMessage(content="夕阳下看大海的少女")]},
-            config=config,
-        )
-
-        assert result.get("image_step") in ("generate", "ask_confirm", "ask_prompt")
-        print(f"意图保持: step={result.get('image_step')}")
+        # 主Agent应该直接聊天回复，不进入生图Agent
+        assert "image_url" not in result
+        assert len(result["messages"]) == 1
+        print(f"生图后聊天: {result['messages'][0].content[:60]}...")
 
 
 # ============== 测试：独立功能模块 ==============
@@ -263,25 +265,17 @@ class TestProviders:
 
     def test_register_provider(self, llm):
         """测试注册Provider"""
-        manager = ImageConversationManager(llm=llm, providers=[])
-        assert len(manager.providers) == 0
+        agent = ImageSubAgent(llm=llm, providers=[])
+        assert len(agent.providers) == 0
 
-        manager.register_provider(DoubaoProvider())
-        assert "doubao" in manager.providers
+        agent.register_provider(DoubaoProvider())
+        assert "doubao" in agent.providers
 
-        manager.register_provider(JimengProvider())
-        assert "jimeng" in manager.providers
-        assert len(manager.providers) == 2
-
-    def test_available_providers(self, llm):
-        """测试获取可用Provider列表"""
-        manager = ImageConversationManager(
-            llm=llm,
-            providers=[DoubaoProvider(), JimengProvider()],
-        )
-        names = manager.get_available_providers()
+    def test_default_provider(self, llm):
+        """测试默认Provider"""
+        agent = create_image_agent(llm=llm)
+        names = agent.get_available_providers()
         assert "doubao" in names
-        assert "jimeng" in names
 
 
 # ============== 辅助函数：直接运行测试 ==============
@@ -289,53 +283,56 @@ class TestProviders:
 def run_all_tests():
     """运行核心测试（不需要pytest）"""
     llm = create_chat_model("deepseek")
-    manager = ImageConversationManager(llm=llm, providers=[])
 
     print("=" * 60)
-    print("ImageConversationManager 测试")
+    print("HuesaeAgents 架构重构测试")
     print("=" * 60)
 
-    # 1. 意图保持
-    print("\n--- 测试1: 子图对话中保持意图 ---")
-    state = {"messages": [HumanMessage(content="我想生成图片")], "image_step": "ask_prompt"}
-    result = classify_intent(state)
-    print(f"✓ 子图保持: {result}")
+    # 1. 主Agent意图分类
+    print("\n--- 测试1: 主Agent意图分类 ---")
+    main = HuesaeMainAgent(llm=llm)
+    main.register_sub_agent(create_image_agent(llm=llm))
 
-    # 2. 追问
-    print("\n--- 测试2: 缺少提示词时追问 ---")
-    result = manager.process({}, "我想生成图片")
-    print(f"✓ 追问: {result['messages'][0].content[:60]}...")
+    intent = main._classify_intent({}, "我想生成图片")
+    print(f"✓ 生图意图: {intent}")
 
-    # 3. 有提示词
-    print("\n--- 测试3: 有明确提示词 ---")
+    intent = main._classify_intent({}, "今天天气怎么样")
+    print(f"✓ 聊天意图: {intent}")
+
+    # 2. 生图对话中保持意图
     state = {
         "messages": [
             HumanMessage(content="我想生成图片"),
             AIMessage(content="请描述一下？"),
-            HumanMessage(content="夕阳下看大海的少女"),
         ],
     }
-    result = manager.process(state, "夕阳下看大海的少女")
-    print(f"✓ 有提示词: step={result['image_step']}, prompt={result.get('image_prompt')}")
+    intent = main._classify_intent(state, "夕阳下看大海的少女")
+    print(f"✓ 生图对话保持: {intent}")
 
-    # 4. Graph多轮
-    print("\n--- 测试4: Graph 多轮对话 ---")
-    from huesaeagents.huesae.graph.huesae_graph import create_huesae_graph
+    # 3. 生图后切回聊天
+    state = {
+        "messages": [
+            HumanMessage(content="我想生成图片"),
+            AIMessage(content="图片已生成完成~"),
+        ],
+    }
+    intent = main._classify_intent(state, "真好看")
+    print(f"✓ 生图后切回聊天: {intent}")
 
-    graph = create_huesae_graph()
-    config = {"configurable": {"thread_id": "demo_test"}}
+    # 4. 子Agent标准化接口
+    print("\n--- 测试2: 子Agent标准化接口 ---")
+    image_agent = ImageSubAgent(llm=llm, providers=[])
+    result = image_agent.process({}, "我想生成图片")
+    print(f"✓ 追问: action={result['action']}")
+    assert "action" in result and "response" in result
 
-    result = graph.invoke(
-        {"messages": [HumanMessage(content="我想生成图片")]},
-        config=config,
-    )
-    print(f"✓ 第一轮: step={result.get('image_step')}")
+    # 5. 主Agent集成
+    print("\n--- 测试3: 主Agent集成 ---")
+    result = main.process({"messages": []}, "你好")
+    print(f"✓ 直接聊天: {result['messages'][0].content[:40]}...")
 
-    result = graph.invoke(
-        {"messages": [HumanMessage(content="夕阳下看大海的少女")]},
-        config=config,
-    )
-    print(f"✓ 第二轮: step={result.get('image_step')}, prompt={result.get('image_prompt')}")
+    result = main.process({"messages": []}, "我想生成图片")
+    print(f"✓ 委派生图: {result['messages'][0].content[:40]}...")
 
     print("\n" + "=" * 60)
     print("测试完成")

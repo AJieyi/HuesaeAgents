@@ -1,19 +1,17 @@
-"""生图对话管理器
+"""生图子Agent
 
-用LLM驱动对话流程，替代硬编码状态机。
-支持：追问、推荐、扩写、确认、生图、换图
+主Agent的委派组件，负责处理生图相关的多轮对话。
+自身无状态，每次根据完整对话历史做决策。
 
-核心设计：
-- 每个回合，LLM分析完整对话历史，输出结构化决策（action/response/prompt）
-- 根据action执行对应操作（追问、调用扩写、准备生图等）
-- 实际生图由Graph节点调用异步方法完成
+支持流程：追问 → 推荐 → 扩写 → 确认 → 生图 → 展示 → 结束
 """
 from typing import Literal
 
 from pydantic import BaseModel, Field
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import HumanMessage
 
+from .base import BaseSubAgent
 from .image import expand_prompt
 from .image.providers import ImageProvider, GenerationResult
 from .image.prompts import IMAGE_CONVERSATION_SYSTEM_MESSAGE
@@ -22,7 +20,7 @@ from .image.prompts import IMAGE_CONVERSATION_SYSTEM_MESSAGE
 # ============== LLM决策模型 ==============
 
 class ImageDecision(BaseModel):
-    """子图Agent每回合的决策"""
+    """子Agent每回合的决策"""
 
     thought: str = Field(description="分析当前对话状态和用户需求")
     action: Literal[
@@ -36,27 +34,44 @@ class ImageDecision(BaseModel):
     ] = Field(description="下一步动作")
     response: str = Field(description="给用户的回复消息，用温柔可爱的二次元语气")
     prompt: str | None = Field(default=None, description="当前确认的提示词")
-    provider: str | None = Field(default=None, description="选择的生图工具（doubao/jimeng）")
+    provider: str | None = Field(default=None, description="选择的生图工具（当前固定doubao）")
 
 
-# ============== 对话管理器 ==============
+# ============== 标准化返回格式 ==============
 
-class ImageConversationManager:
-    """生图对话管理器
+def _make_result(
+    action: str,
+    response: str,
+    prompt: str | None = None,
+    provider: str | None = None,
+    **kwargs,
+) -> dict:
+    """构造标准化的子Agent返回结果"""
+    return {
+        "action": action,
+        "response": response,
+        "prompt": prompt,
+        "provider": provider,
+        "data": kwargs,
+    }
 
-    用LLM驱动对话流程，实现"思考-澄清-行动"闭环。
+
+# ============== 生图子Agent ==============
+
+class ImageSubAgent(BaseSubAgent):
+    """生图子Agent
+
+    无状态组件，每次调用接收完整对话历史，用 LLM 分析后输出决策。
+    所有回复交给主Agent包装展示。
 
     Example:
-        >>> from models.models_factory import create_chat_model
-        >>> from agents.subagents.image.providers import DoubaoProvider, JimengProvider
-        >>> manager = ImageConversationManager(
-        ...     llm=create_chat_model("deepseek"),
-        ...     providers=[DoubaoProvider(), JimengProvider()]
-        ... )
-        >>> result = manager.process({}, "我想生成图片")
-        >>> print(result["messages"][0].content)
-        '请告诉我您想要生成什么样的图片？...'
+        >>> agent = ImageSubAgent(llm=create_chat_model("deepseek"))
+        >>> result = agent.process({"messages": [...]}, "我想生成图片")
+        >>> print(result["action"])  # "ask_prompt"
+        >>> print(result["response"])  # "请告诉我您想要生成什么样的图片？..."
     """
+
+    name = "image"
 
     def __init__(
         self,
@@ -75,52 +90,51 @@ class ImageConversationManager:
         """注册生图Provider（扩展点）"""
         self.providers[provider.name] = provider
 
-    # ============== 主入口 ==============
+    # ============== 主入口：标准化接口 ==============
 
     def process(self, state: dict, user_input: str) -> dict:
-        """处理用户输入
-
-        1. LLM决策（分析对话历史 → 决定action）
-        2. 根据action执行对应操作
+        """处理用户输入，返回标准化结果
 
         Args:
-            state: 当前Graph状态（包含messages等）
+            state: 当前状态（包含 messages 对话历史）
             user_input: 用户最新输入
 
         Returns:
-            dict: 更新后的状态，包含messages、image_step等
+            dict: 标准化结果 {action, response, prompt, provider, data}
         """
         # 1. LLM决策
         decision = self._decide(state, user_input)
 
-        # 2. 根据action执行
+        # 2. 根据action执行对应操作，返回标准化格式
         if decision.action == "expand":
             return self._handle_expand(decision, user_input)
         elif decision.action == "generate":
             return self._handle_generate(decision)
         elif decision.action in ("ask_prompt", "recommend", "ask_confirm"):
-            return {
-                "image_step": decision.action,
-                "image_prompt": decision.prompt,
-                "messages": [AIMessage(content=decision.response)],
-            }
+            return _make_result(
+                action=decision.action,
+                response=decision.response,
+                prompt=decision.prompt,
+                provider="doubao",
+            )
         elif decision.action == "show_image":
-            return {
-                "image_step": "show_image",
-                "image_prompt": decision.prompt,
-                "messages": [AIMessage(content=decision.response)],
-            }
+            return _make_result(
+                action="show_image",
+                response=decision.response,
+                prompt=decision.prompt,
+                provider="doubao",
+            )
         elif decision.action == "finish":
-            return {
-                "image_step": "finish",
-                "messages": [AIMessage(content=decision.response)],
-            }
+            return _make_result(
+                action="finish",
+                response=decision.response,
+            )
 
         # 默认：追问
-        return {
-            "image_step": "ask_prompt",
-            "messages": [AIMessage(content=decision.response)],
-        }
+        return _make_result(
+            action="ask_prompt",
+            response=decision.response or "请告诉我您想要生成什么样的图片？",
+        )
 
     # ============== LLM决策 ==============
 
@@ -131,9 +145,9 @@ class ImageConversationManager:
         """
         # 构建对话历史（取最近的消息，避免超出上下文）
         messages = state.get("messages", [])
-        history_text = self._format_history(messages[-8:])  # 最近8条
+        history_text = self._format_history(messages[-6:])  # 最近6条
         current_prompt = state.get("image_prompt", "")
-        available_tools = ", ".join(self.providers.keys()) or "doubao, jimeng"
+        available_tools = ", ".join(self.providers.keys()) or "doubao"
 
         user_prompt = f"""请分析当前对话状态，输出下一步决策。
 
@@ -184,37 +198,29 @@ class ImageConversationManager:
         prompt_to_expand = decision.prompt or user_input
         expanded = expand_prompt(prompt_to_expand, self.llm)
 
-        return {
-            "image_step": "ask_confirm",
-            "image_prompt": prompt_to_expand,
-            "expanded_prompt": expanded,
-            "messages": [
-                AIMessage(
-                    content=(
-                        f"扩写后的描述：\n"
-                        f"{expanded}\n\n"
-                        f"这个描述可以吗？需要修改哪里吗？"
-                    )
-                )
-            ],
-        }
+        return _make_result(
+            action="ask_confirm",
+            response=(
+                f"扩写后的描述：\n"
+                f"{expanded}\n\n"
+                f"这个描述可以吗？需要修改哪里吗？"
+            ),
+            prompt=prompt_to_expand,
+            expanded_prompt=expanded,
+        )
 
     def _handle_generate(self, decision: ImageDecision) -> dict:
         """处理生图决策
 
-        不实际调用provider（异步操作由Graph节点执行），
+        不实际调用provider（异步操作由主Agent执行），
         只返回generate状态和相关参数。
         """
-        return {
-            "image_step": "generate",
-            "image_prompt": decision.prompt,
-            "selected_provider": decision.provider or self.default_provider,
-            "messages": [
-                AIMessage(
-                    content=decision.response or "图片正在生成中，请稍等~"
-                )
-            ],
-        }
+        return _make_result(
+            action="generate",
+            response=decision.response or "图片正在生成中，请稍等~",
+            prompt=decision.prompt,
+            provider="doubao",
+        )
 
     # ============== 生图执行 ==============
 
@@ -256,15 +262,15 @@ class ImageConversationManager:
 def create_image_agent(
     llm: BaseChatModel | None = None,
     providers: list[ImageProvider] | None = None,
-) -> ImageConversationManager:
+) -> ImageSubAgent:
     """创建生图Agent工厂函数
 
     Args:
         llm: 大语言模型，默认使用DeepSeek
-        providers: Provider列表，默认包含Doubao和Jimeng
+        providers: Provider列表，默认包含Doubao
 
     Returns:
-        ImageConversationManager: 生图对话管理器实例
+        ImageSubAgent: 生图子Agent实例
     """
     if llm is None:
         try:
@@ -274,7 +280,7 @@ def create_image_agent(
         llm = create_chat_model("deepseek")
 
     if providers is None:
-        from .image.providers import DoubaoProvider, JimengProvider
-        providers = [DoubaoProvider(), JimengProvider()]
+        from .image.providers import DoubaoProvider
+        providers = [DoubaoProvider()]
 
-    return ImageConversationManager(llm=llm, providers=providers)
+    return ImageSubAgent(llm=llm, providers=providers)
