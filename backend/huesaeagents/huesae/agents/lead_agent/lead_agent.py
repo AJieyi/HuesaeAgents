@@ -223,9 +223,15 @@ class HuesaeMainAgent:
 
         # 子Agent返回的是"执行生图"
         if action == "generate":
-            result = self._handle_generate_image(agent, sub_result)
-            result["clear_image_goal"] = True
-            return result
+            # 返回待生成标记，由外部（chat_loop）控制实际执行和流式提示
+            return {
+                "messages": [
+                    AIMessage(content=sub_result.get("response", "图片正在生成中，请稍等~"))
+                ],
+                "pending_generation": True,
+                "prompt": sub_result.get("prompt", ""),
+                "image_goal": image_goal,
+            }
 
         # 子Agent返回结束
         if action == "finish":
@@ -265,30 +271,26 @@ class HuesaeMainAgent:
             return "好的，我来帮您~"
         return "好的~"
 
-    def _handle_generate_image(self, agent: BaseSubAgent, sub_result: dict) -> dict:
-        """执行生图并包装展示"""
-        import asyncio
+    async def execute_image_generation(self, prompt: str) -> dict:
+        """执行生图并返回结果（供外部调用）
 
-        prompt = sub_result.get("prompt", "")
+        Args:
+            prompt: 生图提示词
 
-        # 调用生图（风格处理由子Agent内部完成）
-        try:
-            generation = asyncio.run(agent.generate_image(prompt))
+        Returns:
+            dict: {wrap_message, image_url} 或抛出异常
+        """
+        agent = self.sub_agents.get(Intent.IMAGE)
+        if not agent:
+            raise ValueError("Image agent not registered")
 
-            # 主Agent包装语
-            wrap_msg = self._create_wrap_message()
+        generation = await agent.generate_image(prompt)
+        wrap_msg = self._create_wrap_message()
 
-            return {
-                "messages": [
-                    AIMessage(content=sub_result["response"]),  # "图片正在生成中~"
-                    AIMessage(content=wrap_msg),  # "这是生成好的图片哦~"
-                ],
-                "image_url": generation.url,
-            }
-        except Exception as e:
-            return {
-                "messages": [AIMessage(content=f"图片生成失败：{str(e)}")],
-            }
+        return {
+            "wrap_message": wrap_msg,
+            "image_url": generation.url,
+        }
 
     def _create_wrap_message(self) -> str:
         """用主Agent的角色语气生成图片展示语"""
