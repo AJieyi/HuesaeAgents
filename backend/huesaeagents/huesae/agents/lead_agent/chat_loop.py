@@ -60,6 +60,12 @@ def run_chat_loop():
     session_id = "terminal_user"
     conv_state = state_manager.get_state(session_id)
 
+    # 启动时清除可能残留的 image 状态（防止上次异常退出导致）
+    if conv_state.image_intent:
+        print("[系统] 检测到残留的生图状态，已重置\n")
+        conv_state.clear_image()
+        state_manager.save_state(session_id)
+
     print("=" * 50)
     print("HuesaeAgents 终端交互")
     print("=" * 50)
@@ -83,9 +89,12 @@ def run_chat_loop():
             continue
 
         # 构建 state dict（从 StateManager 读取当前状态）
+        # image_context 是生图Agent的独立对话历史，隔离于主 messages
         state = {
             "messages": conv_state.messages,
-            "image_goal": conv_state.image_goal,
+            "image_context": conv_state.image_context,
+            "image_intent": conv_state.image_intent,
+            "current_image_prompt": conv_state.current_image_prompt,
         }
 
         # 调用主Agent
@@ -104,7 +113,7 @@ def run_chat_loop():
             print_stream("图片正在生成中，请稍等~")
             print()
 
-            # 先保存用户输入和"生成中"提示到对话历史
+            # 先保存用户输入和"生成中"提示到主对话历史
             conv_state.messages.append(HumanMessage(content=user_input))
             generating_msg = result["messages"][0].content if result.get("messages") else "图片正在生成中，请稍等~"
             conv_state.messages.append(AIMessage(content=generating_msg))
@@ -120,34 +129,46 @@ def run_chat_loop():
                 # 显示图片URL
                 print(f"[图片] {image_result['image_url']}\n")
 
-                # 生图完成后更新对话历史（包装语作为AI回复）
+                # 生图完成后更新主对话历史（包装语作为AI回复）
                 conv_state.messages.append(AIMessage(content=image_result["wrap_message"]))
 
-                # 清除 image_goal（生图流程结束）
-                conv_state.image_goal = None
+                # 保存当前提示词（用于后续换图）
+                conv_state.current_image_prompt = prompt
+
+                # 将包装语追加到子上下文（子Agent能看到图片已生成）
+                conv_state.image_context.append(AIMessage(content=image_result["wrap_message"]))
+
+                # 不立即清除 image 状态，保留以支持换图/扩写
 
             except Exception as e:
                 error_msg = f"图片生成失败：{str(e)}"
                 print_stream(error_msg)
                 print()
                 conv_state.messages.append(AIMessage(content=error_msg))
+                # 失败时清除 image 状态
+                conv_state.clear_image()
 
             # 保存状态并跳过常规更新
             state_manager.save_state(session_id)
             continue
 
-        # 更新对话历史到状态管理器
+        # 更新主对话历史
         conv_state.messages.append(HumanMessage(content=user_input))
         conv_state.messages.extend(result.get("messages", []))
 
-        # 管理 image_goal 生命周期
-        if "image_goal" in result:
-            conv_state.image_goal = result["image_goal"]
-        if result.get("clear_image_goal"):
-            conv_state.image_goal = None
+        # 管理 image 状态生命周期
+        if "image_intent" in result:
+            conv_state.image_intent = result["image_intent"]
+        if "image_context" in result:
+            conv_state.image_context = result["image_context"]
+        if result.get("clear_image_intent"):
+            conv_state.clear_image()
 
         # 持久化状态
         state_manager.save_state(session_id)
+
+    # 退出时清除持久化状态（避免下次启动保留旧对话）
+    state_manager.clear_state(session_id)
 
 
 if __name__ == "__main__":

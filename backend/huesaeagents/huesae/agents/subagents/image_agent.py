@@ -147,7 +147,7 @@ class ImageSubAgent(BaseSubAgent):
         messages = state.get("messages", [])
         history_text = self._format_history(messages[-6:])  # 最近6条
         current_prompt = state.get("image_prompt", "")
-        image_goal = state.get("image_goal", "generate_image")
+        image_intent = state.get("image_intent", "generate_image")
         available_tools = ", ".join(self.providers.keys()) or "doubao"
 
         user_prompt = f"""请分析当前对话状态，输出下一步决策。
@@ -155,7 +155,7 @@ class ImageSubAgent(BaseSubAgent):
 当前状态：
 - 用户最新输入：{user_input}
 - 当前已确认的提示词：{current_prompt or "（暂无）"}
-- 用户原始意图：{image_goal}（generate_image=生成图片, expand_prompt=扩写提示词, convert_tags=转成Danbooru标签）
+- 用户原始意图：{image_intent}（generate_image=生成图片, expand_prompt=扩写提示词, convert_tags=转成Danbooru标签）
 - 可用生图工具：{available_tools}
 
 最近对话历史：
@@ -193,12 +193,30 @@ class ImageSubAgent(BaseSubAgent):
                 lines.append(f"{role}：{msg.content}")
         return "\n".join(lines) if lines else "（无历史对话）"
 
+    # ============== 风格处理 ==============
+
+    @staticmethod
+    def _ensure_anime_style(prompt: str) -> str:
+        """确保提示词包含动漫风格前缀
+
+        默认添加"二次元动漫风格"前缀，除非用户明确要求真人/写实风格。
+        """
+        if not prompt:
+            return prompt
+        lower = prompt.lower()
+        # 用户明确要求非动漫风格
+        if any(kw in lower for kw in ["真人", "写实", "照片", "photorealistic", "realistic", "real person"]):
+            return prompt
+        # 已经包含动漫关键词
+        return f"图片风格为 二次元，{prompt}"
+
     # ============== Action处理 ==============
 
     def _handle_expand(self, decision: ImageDecision, user_input: str) -> dict:
         """处理扩写：调用expand_prompt，返回确认状态"""
         prompt_to_expand = decision.prompt or user_input
         expanded = expand_prompt(prompt_to_expand, self.llm)
+        expanded = self._ensure_anime_style(expanded)
 
         return _make_result(
             action="ask_confirm",
@@ -217,10 +235,11 @@ class ImageSubAgent(BaseSubAgent):
         不实际调用provider（异步操作由主Agent执行），
         只返回generate状态和相关参数。
         """
+        prompt = self._ensure_anime_style(decision.prompt or "")
         return _make_result(
             action="generate",
             response=decision.response or "图片正在生成中，请稍等~",
-            prompt=decision.prompt,
+            prompt=prompt,
             provider="doubao",
         )
 
