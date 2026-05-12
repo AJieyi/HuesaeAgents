@@ -55,8 +55,9 @@ class DoubaoClient:
         self,
         prompt: str,
         size: str = "2K",
+        watermark: bool = False,
         response_format: str = "url",
-        watermark: bool = True,
+        output_format: str = "jpeg",
         timeout: int = 120,
     ) -> str:
         """
@@ -64,9 +65,10 @@ class DoubaoClient:
 
         Args:
             prompt: 文本提示词
-            size: 图片尺寸，支持 1K, 2K, 4K 等
-            response_format: 返回格式，url 或 b64_json
-            watermark: 是否添加水印
+            size: 图片尺寸，支持 1K, 2K, 4K 等，默认 2K
+            watermark: 是否添加水印，默认 False
+            response_format: 返回格式，url 或 b64_json，默认 url
+            output_format: 输出图片格式，支持 jpeg/png，默认 jpeg
             timeout: 超时时间（秒）
 
         Returns:
@@ -83,6 +85,7 @@ class DoubaoClient:
                 response_format=response_format,
                 extra_body={
                     "watermark": watermark,
+                    "output_format": output_format,
                 },
                 timeout=timeout,
             )
@@ -136,7 +139,8 @@ class DoubaoClient:
         prompt: str,
         size: str = "2K",
         max_images: int = 4,
-        watermark: bool = True,
+        watermark: bool = False,
+        output_format: str = "jpeg",
         timeout: int = 300,
     ) -> Generator[str, None, None]:
         """
@@ -144,9 +148,10 @@ class DoubaoClient:
 
         Args:
             prompt: 提示词，需描述生成一组连贯图片
-            size: 图片尺寸
+            size: 图片尺寸，默认 2K
             max_images: 最大图片数量，默认4
-            watermark: 是否添加水印
+            watermark: 是否添加水印，默认 False
+            output_format: 输出图片格式，支持 jpeg/png，默认 jpeg
             timeout: 超时时间（秒）
 
         Yields:
@@ -168,6 +173,7 @@ class DoubaoClient:
                     "sequential_image_generation_options": {
                         "max_images": max_images,
                     },
+                    "output_format": output_format,
                 },
                 timeout=timeout,
             )

@@ -143,7 +143,9 @@ class DoubaoImageError(Exception):
 async def generate_image_by_doubao(
     prompt: str,
     size: str = "2K",
-    watermark: bool = True,
+    watermark: bool = False,
+    response_format: str = "url",
+    output_format: str = "jpeg",
     timeout: int = 120,
 ) -> str:
     """
@@ -152,11 +154,13 @@ async def generate_image_by_doubao(
     Args:
         prompt: 自然语言描述，如 "星际穿越，黑洞，黑洞里冲出一辆快支离破碎的复古列车"
         size: 图片尺寸，支持 1K, 2K, 4K 等，默认 2K
-        watermark: 是否添加水印，默认 True
+        watermark: 是否添加水印，默认 False
+        response_format: 返回格式，url 或 b64_json，默认 url
+        output_format: 输出图片格式，支持 jpeg/png，默认 jpeg
         timeout: 超时时间（秒），默认 120
 
     Returns:
-        生成的图片 URL
+        生成的图片 URL 或 base64 JSON
 
     Raises:
         DoubaoImageError: 生成失败时抛出
@@ -172,8 +176,9 @@ async def generate_image_by_doubao(
     return client.generate_image(
         prompt=prompt,
         size=size,
-        response_format="url",
         watermark=watermark,
+        response_format=response_format,
+        output_format=output_format,
         timeout=timeout,
     )
 
@@ -181,18 +186,21 @@ async def generate_image_by_doubao(
 async def generate_images_by_doubao(
     prompt: str,
     size: str = "2K",
-    max_images: int = 4,
-    watermark: bool = True,
+    max_images: int = 10,
+    watermark: bool = False,
+    response_format: str = "url",
+    output_format: str = "jpeg",
     timeout: int = 300,
 ) -> list[str]:
     """
-    生成一组图片（豆包）
+    生成一组图片（豆包，组图模式）
 
     Args:
         prompt: 提示词，需描述生成一组连贯图片，如 "生成一组共4张连贯插画，核心为同一庭院一角的四季变迁"
         size: 图片尺寸，支持 1K, 2K, 4K 等，默认 2K
-        max_images: 最大图片数量，默认4
-        watermark: 是否添加水印，默认 True
+        max_images: 最大图片数量，默认 10
+        watermark: 是否添加水印，默认 False
+        output_format: 输出图片格式，支持 jpeg/png，默认 jpeg
         timeout: 超时时间（秒），默认 300
 
     Returns:
@@ -213,6 +221,8 @@ async def generate_images_by_doubao(
         size=size,
         max_images=max_images,
         watermark=watermark,
+        response_format=response_format,
+        output_format=output_format,
         timeout=timeout,
     )
 
