@@ -1,33 +1,21 @@
-"""主Agent（Lead Agent）
+"""主Agent（Lead Agent）- DeerFlow Harness Engineering 模式
 
-对话核心，负责：
-1. 意图分类（LLM驱动，基于完整对话历史，返回 intent + image_intent）
-2. 委派子Agent或直接聊天回复
-3. 包装子Agent结果，保持角色语气
+对话核心，采用 ReAct 循环让 LLM 自主决策：
+- 直接回复用户
+- 调用工具（生图、扩写、标签转换等）
+- 委托子Agent处理复杂多轮对话
 
-无状态设计，每次调用接收完整对话历史。
+核心设计原则：
+1. 工具选择完全由 LLM 决定，系统只提供工具列表和描述
+2. 新增子Agent = 新增工具，无需修改分类逻辑
+3. 保留子Agent的多轮对话能力（通过 task_tool 委托）
 """
-from typing import Literal
-
-from pydantic import BaseModel, Field
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
+from ...subagents.registry import SubAgentRegistry
+from ...tools.tools import Action, create_tools, parse_subagent_task
 from ..subagents.base import BaseSubAgent
-
-
-# ============== 意图常量 ==============
-
-class Intent:
-    """意图分类常量"""
-
-    CHAT = "chat"
-    IMAGE = "image"
-    VOICE = "voice"
-    MEMORY = "memory"
-    SEARCH = "search"
-    REMIND = "remind"
-    SAFE = "safe"
 
 
 # ============== 安全检查 ==============
@@ -38,48 +26,67 @@ _SAFE_KEYWORDS = [
 ]
 
 
-# ============== LLM意图分类模型 ==============
+# ============== 主Agent系统提示词 ==============
 
-class IntentResult(BaseModel):
-    """LLM意图识别结果"""
+MAIN_AGENT_SYSTEM_PROMPT = """你是 HuesaeAgents 的主Agent，负责理解用户需求并选择合适的工具或回复方式。
 
-    intent: Literal[
-        "chat", "image", "voice", "memory", "search", "remind"
-    ] = Field(
-        description="用户意图：chat=普通聊天, image=生图/画画/图片相关(含扩写、标签), "
-                    "voice=语音/声音, memory=记忆/日记/记录, search=搜索/查询, "
-                    "remind=提醒/闹钟/定时"
-    )
-    image_intent: Literal[
-        "generate_image", "expand_prompt", "convert_tags"
-    ] | None = Field(
-        default=None,
-        description="当 intent=image 时的子分类："
-                    "generate_image=生成图片(默认), "
-                    "expand_prompt=扩写提示词, "
-                    "convert_tags=转成Danbooru标签"
-    )
-    reason: str = Field(default="", description="判断理由")
+## 你的角色
+{character_tone}
+
+## 可用工具
+{tools_description}
+
+## 可委派子Agent
+{subagents_description}
+
+## 工作原则
+1. 仔细分析用户需求，选择最合适的工具或直接回复
+2. 当用户需求明确且简单时，直接调用对应工具（如明确说"生成一张夕阳下的大海"）
+3. 当用户需求模糊或需要多轮对话时，调用 task_tool 委托子Agent处理
+4. 调用工具后，基于工具结果给用户友好的回复
+5. 每次只能选择一个行动：直接回复 或 调用一个工具
+
+## 工具选择指南
+- 工具描述是你选择工具的主要依据，优先根据工具名称、参数和描述做决策
+- generate_image_tool: 用户明确要求生成单张图片（"画一只猫"、"生成一张..."）
+- generate_images_tool: 用户明确要求生成多张图片（"生成4张四季插画"、"来一组头像"）
+- expand_prompt_tool: 用户要求扩写图片描述（"扩写一下"、"写详细点"）
+- convert_tags_tool: 用户要求转成Danbooru标签（"生成标签"、"转成标签"）
+- task_tool: 用户说"我想生成图片"但没给具体描述、需要推荐、需要多轮确认
+- reply: 日常聊天、问候、用户说"不用了"、"谢谢"等
+
+## 输出格式
+请以 JSON 格式输出：
+{{
+  "thought": "分析用户需求...",
+  "type": "reply 或 tool_call",
+  "tool_name": "工具名称（type=tool_call时）",
+  "tool_args": {{参数}},
+  "response": "直接回复内容（type=reply时）"
+}}
+"""
 
 
 # ============== 主Agent ==============
 
 class HuesaeMainAgent:
-    """主Agent：对话核心 + 子Agent委派
+    """主Agent：LLM 自主工具选择的 ReAct 循环
 
-    每轮接收用户输入，用 LLM 做意图分类，然后：
-    - 需要子Agent：调用子Agent获取结果，主Agent包装展示
-    - 不需要子Agent：主Agent直接聊天回复
+    每轮接收用户输入，让 LLM 自主决策：
+    - 直接回复
+    - 调用工具
+    - 委托子Agent
 
     Example:
         >>> from huesae.models.models_factory import create_chat_model
         >>> from huesae.agents.subagents.image_agent import create_image_agent
         >>> main = HuesaeMainAgent(llm=create_chat_model("deepseek"))
         >>> main.register_sub_agent(create_image_agent())
-        >>> result = main.process({"messages": []}, "我想生成图片")
+        >>> result = main.process({"messages": []}, "生成一张夕阳下的大海")
         >>> print(result["messages"][0].content)
-        '请告诉我您想要生成什么样的图片？'
     """
+
+    MAX_STEPS = 3  # ReAct 循环最大步数
 
     def __init__(
         self,
@@ -88,194 +95,276 @@ class HuesaeMainAgent:
     ):
         self.llm = llm
         self.character_id = character_id
-        self.sub_agents: dict[str, BaseSubAgent] = {}
+        self.subagent_registry = SubAgentRegistry()
+        self.tools = []
+        self.tool_map = {}
+        self._refresh_tools()
+
+    def _refresh_tools(self) -> None:
+        """刷新工具列表。
+
+        子Agent注册变化会影响 task_tool 的可用描述，因此注册后刷新一次。
+        """
+        self.tools = create_tools(self.llm, subagent_registry=self.subagent_registry)
+        self.tool_map = {t.name: t for t in self.tools}
 
     def register_sub_agent(self, agent: BaseSubAgent) -> None:
         """注册子Agent"""
-        self.sub_agents[agent.name] = agent
+        description = None
+        if agent.name == "image":
+            description = "生图对话Agent，处理追问、推荐、扩写、确认、单图和组图生成。"
+        self.subagent_registry.register(agent, description=description)
+        self._refresh_tools()
 
     # ============== 主入口 ==============
 
     def process(self, state: dict, user_input: str) -> dict:
-        """处理用户输入
+        """处理用户输入（ReAct 循环）
 
         Args:
-            state: 当前状态，包含 messages 对话历史
+            state: 当前状态，包含 messages 对话历史等
             user_input: 用户最新输入
 
         Returns:
-            dict: 包含 messages 列表，可选 pending_generation/prompt/image_intent/clear_image_intent
+            dict: 包含 messages 列表，可选 pending_generation/prompt 等
         """
         # 1. 安全检查（最高优先级）
         if self._check_safety(user_input):
             return {
                 "messages": [AIMessage(content=self._safety_response())],
                 "safety_flag": True,
-                "high_risk_flag": True,
             }
 
-        # 2. 意图分类
-        # 如果当前已有 image_intent，说明在 image 流程中，直接复用意图
-        # 避免每轮都调用 LLM 做意图分类，节省调用次数
-        if state.get("image_intent"):
-            intent = Intent.IMAGE
-        else:
-            intent_result = self._classify_intent(state, user_input)
-            intent = intent_result.intent
-            if intent == Intent.IMAGE:
-                state = dict(state)
-                state["image_intent"] = intent_result.image_intent or "generate_image"
+        # 2. 如果在子Agent上下文中，直接委托给子Agent
+        if state.get("active_subagent"):
+            return self._handle_subagent(state, user_input)
 
-        # 3. 如果意图匹配子Agent，调用子Agent
-        if intent in self.sub_agents:
-            state = dict(state)  # 复制，避免修改外部原始对象
-            return self._handle_sub_agent(intent, state, user_input)
+        # 3. ReAct 循环
+        tool_results = []
 
-        # 4. 否则主Agent直接聊天回复
+        for step in range(self.MAX_STEPS):
+            # 构建系统提示词（含工具描述 + 角色语气）
+            system_msg = self._build_system_prompt()
+
+            # 构建消息列表
+            messages = [system_msg]
+            # 加入历史消息（最近10条）
+            messages.extend(state.get("messages", [])[-10:])
+            # 加入用户输入
+            messages.append(HumanMessage(content=user_input))
+            # 加入之前的工具结果
+            for result in tool_results:
+                messages.append(AIMessage(content=f"工具执行结果：{result}"))
+
+            # 调用 LLM 获取 Action
+            try:
+                structured_llm = self.llm.with_structured_output(
+                    Action,
+                    method="json_mode",
+                )
+                action = structured_llm.invoke(messages)
+            except Exception:
+                # Fallback：直接聊天
+                chat_response = self._chat_reply(state, user_input)
+                return {"messages": [AIMessage(content=chat_response)]}
+
+            if action.type == "reply":
+                return {"messages": [AIMessage(content=action.response)]}
+
+            if action.type == "tool_call":
+                tool_args = action.tool_args or {}
+                # 生图工具：返回 pending_generation，由外层异步执行
+                if action.tool_name in ("generate_image_tool", "generate_images_tool"):
+                    return {
+                        "messages": [AIMessage(content="图片正在生成中，请稍等~")],
+                        "pending_generation": True,
+                        "prompt": tool_args.get("prompt", ""),
+                        "size": tool_args.get("size", "2K"),
+                        "output_format": tool_args.get("output_format", "jpeg"),
+                        "is_batch": action.tool_name == "generate_images_tool",
+                    }
+
+                result = self._execute_tool(action.tool_name, tool_args)
+
+                # 检查是否是子Agent委托
+                task = parse_subagent_task(result) if isinstance(result, str) else None
+                if task is not None:
+                    subagent_type, description = task
+                    return self._start_subagent(state, subagent_type, description)
+
+                # 快速工具：结果加入上下文，继续循环让LLM生成最终回复
+                tool_results.append(result)
+
+        # 超过最大步数，Fallback 到聊天
         chat_response = self._chat_reply(state, user_input)
-        result = {"messages": [AIMessage(content=chat_response)]}
-        # 如果之前有 image_intent，现在切回聊天，通知调用者清除
-        if "image_intent" in state:
-            result["clear_image_intent"] = True
-        return result
+        return {"messages": [AIMessage(content=chat_response)]}
 
-    # ============== 意图分类 ==============
+    # ============== 系统提示词构建 ==============
 
-    def _classify_intent(self, state: dict, user_input: str) -> IntentResult:
-        """用LLM做意图分类，传入完整对话历史
+    def _build_system_prompt(self) -> SystemMessage:
+        """构建含工具描述的系统提示词"""
+        from .prompts import get_character_system_message
 
-        让LLM同时判断主意图和 image 子意图。
-        """
-        messages = state.get("messages", [])
+        character_msg = get_character_system_message(self.character_id)
+        character_tone = character_msg.content
 
-        # 构建对话历史摘要（最近6条）
-        history_text = self._format_history(messages[-6:])
+        # 构建工具描述
+        tools_desc = []
+        for tool in self.tools:
+            tools_desc.append(f"- {tool.name}: {tool.description}")
+        tools_description = "\n".join(tools_desc)
+        subagents_description = self.subagent_registry.format_for_prompt()
 
-        prompt = f"""分析以下用户输入的意图，进行分类。
+        content = MAIN_AGENT_SYSTEM_PROMPT.format(
+            character_tone=character_tone,
+            tools_description=tools_description,
+            subagents_description=subagents_description,
+        )
+        return SystemMessage(content=content)
 
-当前对话历史：
-{history_text}
+    # ============== 工具执行 ==============
 
-用户最新输入：{user_input}
+    def _execute_tool(self, tool_name: str, tool_args: dict) -> str:
+        """执行指定工具"""
+        if tool_name not in self.tool_map:
+            return f"错误：未知工具 {tool_name}。可用工具：{list(self.tool_map.keys())}"
 
-分类规则：
-- chat：普通聊天、问候、日常问答（如"你好""今天天气如何""真好看""谢谢"）
-- image：与图片生成、画画、绘图、扩写、标签相关的需求
-  - 如果用户输入包含"扩写""扩展""丰富"等词，intent=image，image_intent=expand_prompt
-  - 如果用户输入包含"标签""danbooru""tag"等词，intent=image，image_intent=convert_tags
-  - 如果对话历史中用户之前说过"我想生成图片"等，且当前输入是描述性的，intent=image，image_intent=generate_image
-  - 但如果用户说"真好看""谢谢""换个话题"等，intent=chat
-- voice：与语音、声音、朗读相关的需求
-- memory：与记忆、日记、记录、回忆相关的需求
-- search：与搜索、查询、查找信息相关的需求
-- remind：与提醒、闹钟、定时、日程相关的需求
-
-请以JSON格式输出结果。"""
-
+        tool = self.tool_map[tool_name]
         try:
-            structured_llm = self.llm.with_structured_output(
-                IntentResult,
-                method="json_mode",
-            )
-            result = structured_llm.invoke([HumanMessage(content=prompt)])
-            return result
-        except Exception:
-            # Fallback：简单规则判断
-            return IntentResult(intent=Intent.CHAT, reason="Fallback默认聊天")
-
-    def _format_history(self, messages: list) -> str:
-        """格式化对话历史为文本"""
-        lines = []
-        for msg in messages:
-            if hasattr(msg, "content") and msg.content:
-                role = "用户" if getattr(msg, "type", "") == "human" else "AI"
-                lines.append(f"{role}：{msg.content}")
-        return "\n".join(lines) if lines else "（无历史对话）"
+            # 调用工具函数
+            result = tool.invoke(tool_args)
+            return str(result)
+        except Exception as e:
+            return f"工具执行失败：{str(e)}"
 
     # ============== 子Agent处理 ==============
 
-    def _handle_sub_agent(self, intent: str, state: dict, user_input: str) -> dict:
-        """调用子Agent并包装结果
-
-        子Agent使用独立的 image_context 作为对话历史，
-        避免生图中间过程污染主Agent的消息列表。
+    def _start_subagent(self, state: dict, subagent_type: str, description: str) -> dict:
+        """启动子Agent处理任务
         """
-        agent = self.sub_agents[intent]
-        image_intent = state.get("image_intent", "generate_image")
+        agent = self.subagent_registry.get(subagent_type)
+        if not agent:
+            available = self.subagent_registry.names()
+            return {
+                "messages": [AIMessage(
+                    content=f"抱歉，暂时没有处理这种任务的子Agent~ 可用的子Agent：{available}"
+                )]
+            }
 
-        # 获取或创建子上下文（生图Agent独立对话历史）
-        image_context = list(state.get("image_context", []))
-
-        # 构建子Agent的 state，使用 image_context 作为对话历史
+        # 创建子Agent的初始状态
         sub_state = {
-            "messages": image_context,
-            "image_intent": image_intent,
+            "messages": [],
+            "image_task_type": "generate_image",
         }
 
-        sub_result = agent.process(sub_state, user_input)
+        # 调用子Agent
+        sub_result = agent.process(sub_state, description)
+
+        # 构建子Agent上下文
+        subagent_context = {
+            "agent_type": subagent_type,
+            "agent": agent,
+            "state": sub_state,
+            "history": [
+                HumanMessage(content=description),
+                AIMessage(content=sub_result.get("response", "")),
+            ],
+        }
+
         action = sub_result.get("action", "")
 
-        # 子Agent返回的是"生图流程中的一步"（追问/推荐/确认）
         if action in ("ask_prompt", "recommend", "ask_confirm"):
-            # 将本轮对话追加到子上下文
-            image_context.append(HumanMessage(content=user_input))
-            image_context.append(AIMessage(content=sub_result["response"]))
+            # 子Agent需要继续对话
             return {
                 "messages": [AIMessage(content=sub_result["response"])],
-                "image_intent": image_intent,
-                "image_context": image_context,
+                "active_subagent": subagent_context,
             }
 
-        # 子Agent返回的是"执行生图"
         if action == "generate":
-            # 使用子Agent返回的 prompt，如果没有则使用上一次保存的 prompt（换图场景）
-            prompt = sub_result.get("prompt") or state.get("current_image_prompt", "")
-            # 从子Agent结果中获取生图参数
-            size = sub_result.get("size", "2K")
-            output_format = sub_result.get("output_format", "jpeg")
-            is_batch = sub_result.get("is_batch", False)
-            # 将本轮对话追加到子上下文（保留历史，用于后续换图/扩写）
-            image_context.append(HumanMessage(content=user_input))
-            image_context.append(
-                AIMessage(content=sub_result.get("response", "图片正在生成中，请稍等~"))
-            )
+            # 子Agent决定生图
+            prompt = sub_result.get("prompt", "")
             return {
-                "messages": [
-                    AIMessage(content=sub_result.get("response", "图片正在生成中，请稍等~"))
-                ],
+                "messages": [AIMessage(content=sub_result.get("response", "图片正在生成中，请稍等~"))],
                 "pending_generation": True,
                 "prompt": prompt,
-                "size": size,
-                "output_format": output_format,
-                "is_batch": is_batch,
-                "image_intent": image_intent,
-                "image_context": image_context,
+                "size": self._sub_result_data_value(sub_result, "size", "2K"),
+                "output_format": self._sub_result_data_value(sub_result, "output_format", "jpeg"),
+                "is_batch": self._sub_result_data_value(sub_result, "is_batch", False),
+                "active_subagent": subagent_context,
             }
 
-        # 子Agent返回结束
         if action == "finish":
-            if image_intent == "generate_image":
-                # 生图意图：用主Agent角色语气回复结束语
-                chat_response = self._chat_reply(state, user_input)
-                return {
-                    "messages": [AIMessage(content=chat_response)],
-                    "clear_image_intent": True,
-                    "image_context": [],  # 清空子上下文
-                }
-            else:
-                # 扩写/标签意图：直接返回子Agent的响应（已包含扩写/标签结果）
-                return {
-                    "messages": [AIMessage(content=sub_result["response"])],
-                    "clear_image_intent": True,
-                    "image_context": [],  # 清空子上下文
-                }
+            return {
+                "messages": [AIMessage(content=sub_result["response"])],
+                "clear_subagent": True,
+            }
 
-        # 默认：直接展示子Agent的回复
+        # 默认
         return {
-            "messages": [AIMessage(content=sub_result["response"])],
-            "image_intent": image_intent,
-            "image_context": image_context,
+            "messages": [AIMessage(content=sub_result.get("response", "请告诉我您想要生成什么样的图片？"))],
+            "active_subagent": subagent_context,
         }
+
+    def _handle_subagent(self, state: dict, user_input: str) -> dict:
+        """继续子Agent的对话"""
+        subagent_context = state.get("active_subagent", {})
+        agent = subagent_context.get("agent")
+        sub_state = subagent_context.get("state", {})
+        history = subagent_context.get("history", [])
+
+        if not agent:
+            return {"messages": [AIMessage(content="子Agent状态异常，请重新开始~")]}
+
+        # 更新子Agent状态
+        sub_state["messages"] = history
+
+        # 调用子Agent
+        sub_result = agent.process(sub_state, user_input)
+
+        # 更新历史
+        history.append(HumanMessage(content=user_input))
+        history.append(AIMessage(content=sub_result.get("response", "")))
+        subagent_context["history"] = history
+        subagent_context["state"] = sub_state
+
+        action = sub_result.get("action", "")
+
+        if action in ("ask_prompt", "recommend", "ask_confirm"):
+            return {
+                "messages": [AIMessage(content=sub_result["response"])],
+                "active_subagent": subagent_context,
+            }
+
+        if action == "generate":
+            prompt = sub_result.get("prompt", "")
+            return {
+                "messages": [AIMessage(content=sub_result.get("response", "图片正在生成中，请稍等~"))],
+                "pending_generation": True,
+                "prompt": prompt,
+                "size": self._sub_result_data_value(sub_result, "size", "2K"),
+                "output_format": self._sub_result_data_value(sub_result, "output_format", "jpeg"),
+                "is_batch": self._sub_result_data_value(sub_result, "is_batch", False),
+                "active_subagent": subagent_context,
+            }
+
+        if action == "finish":
+            return {
+                "messages": [AIMessage(content=sub_result["response"])],
+                "clear_subagent": True,
+            }
+
+        return {
+            "messages": [AIMessage(content=sub_result.get("response", ""))],
+            "active_subagent": subagent_context,
+        }
+
+    @staticmethod
+    def _sub_result_data_value(result: dict, key: str, default):
+        """读取子Agent标准返回结果中的 data 字段。"""
+        data = result.get("data") or {}
+        return data.get(key, default)
+
+    # ============== 异步生图（供 chat_loop 调用）=============
 
     async def execute_image_generation(
         self,
@@ -286,16 +375,9 @@ class HuesaeMainAgent:
     ) -> dict:
         """执行生图并返回结果（供外部调用）
 
-        Args:
-            prompt: 生图提示词
-            size: 图片尺寸，默认 2K
-            output_format: 输出格式，默认 jpeg
-            is_batch: 是否使用组图模式，默认 False
-
-        Returns:
-            dict: 单图时 {wrap_message, image_url}，组图时 {wrap_message, image_urls}，或抛出异常
+        保留此方法供 chat_loop 在 pending_generation 场景下调用。
         """
-        agent = self.sub_agents.get(Intent.IMAGE)
+        agent = self.subagent_registry.get("image")
         if not agent:
             raise ValueError("Image agent not registered")
 
@@ -322,9 +404,11 @@ class HuesaeMainAgent:
             "image_url": generation.url,
         }
 
+    # ============== 角色语气包装 ==============
+
     def _create_wrap_message(self) -> str:
         """用主Agent的角色语气生成图片展示语"""
-        from ..subagents.image.prompts import get_character_system_message
+        from .prompts import get_character_system_message
 
         character_msg = get_character_system_message(self.character_id)
         wrap_prompt = (
@@ -340,7 +424,7 @@ class HuesaeMainAgent:
 
     def _chat_reply(self, state: dict, user_input: str) -> str:
         """主Agent直接聊天回复"""
-        from ..subagents.image.prompts import get_character_system_message
+        from .prompts import get_character_system_message
 
         character_msg = get_character_system_message(self.character_id)
         messages = [character_msg] + state.get("messages", []) + [HumanMessage(content=user_input)]

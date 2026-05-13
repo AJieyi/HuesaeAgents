@@ -150,7 +150,7 @@ class ImageSubAgent(BaseSubAgent):
         messages = state.get("messages", [])
         history_text = self._format_history(messages[-6:])  # 最近6条
         current_prompt = state.get("image_prompt", "")
-        image_intent = state.get("image_intent", "generate_image")
+        image_task_type = state.get("image_task_type", "generate_image")
         available_tools = ", ".join(self.providers.keys()) or "doubao"
 
         user_prompt = f"""请分析当前对话状态，输出下一步决策。
@@ -158,13 +158,13 @@ class ImageSubAgent(BaseSubAgent):
 当前状态：
 - 用户最新输入：{user_input}
 - 当前已确认的提示词：{current_prompt or "（暂无）"}
-- 用户原始意图：{image_intent}（generate_image=生成图片, expand_prompt=扩写提示词, convert_tags=转成Danbooru标签）
+- 图片子任务类型：{image_task_type}（generate_image=生成图片, expand_prompt=扩写提示词, convert_tags=转成Danbooru标签）
 - 可用生图工具：{available_tools}
 
 最近对话历史：
 {history_text}
 
-请严格遵循system prompt中的工作流程，特别注意用户原始意图决定最终行为，输出JSON格式决策。"""
+请严格遵循system prompt中的工作流程，特别注意图片子任务类型决定确认后的最终行为，输出JSON格式决策。"""
 
         # 调用LLM
         try:

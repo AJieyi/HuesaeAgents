@@ -1,7 +1,7 @@
 """Agent 测试
 
 测试内容：
-1. 主Agent意图分类（LLM + 对话历史上下文）
+1. 主Agent工具选择和子Agent委派
 2. 子Agent标准化接口（追问、推荐、扩写、确认、生图）
 3. 主Agent集成测试（聊天、委派子Agent、包装展示）
 """
@@ -16,7 +16,7 @@ if str(backend_dir) not in sys.path:
 import pytest
 from langchain_core.messages import HumanMessage, AIMessage
 
-from huesaeagents.huesae.agents.lead_agent import HuesaeMainAgent, Intent
+from huesaeagents.huesae.agents.lead_agent import HuesaeMainAgent
 from huesaeagents.huesae.agents.subagents.image_agent import (
     ImageSubAgent,
     ImageDecision,
@@ -52,50 +52,21 @@ def image_agent(llm):
     return ImageSubAgent(llm=llm, providers=[])
 
 
-# ============== 测试：主Agent意图分类 ==============
+# ============== 测试：主Agent工具和子Agent注册 ==============
 
-class TestMainAgentIntent:
-    """测试主Agent的意图分类"""
+class TestMainAgentHarness:
+    """测试主Agent的工具注册和子Agent委派能力"""
 
-    def test_classify_image_intent(self, main_agent):
-        """测试识别生图意图"""
-        state = {"messages": []}
-        intent = main_agent._classify_intent(state, "我想生成图片")
-        assert intent == Intent.IMAGE
-        print(f"意图识别: {intent}")
+    def test_tools_are_available(self, main_agent):
+        """测试主Agent暴露当前工具列表"""
+        tool_names = {tool.name for tool in main_agent.tools}
+        assert "generate_image_tool" in tool_names
+        assert "generate_images_tool" in tool_names
+        assert "task_tool" in tool_names
 
-    def test_classify_chat_intent(self, main_agent):
-        """测试识别普通对话意图"""
-        state = {"messages": []}
-        intent = main_agent._classify_intent(state, "今天天气怎么样？")
-        assert intent == Intent.CHAT
-        print(f"意图识别: {intent}")
-
-    def test_classify_chat_after_image(self, main_agent):
-        """测试：生图完成后，用户说无关内容，应分类为chat"""
-        state = {
-            "messages": [
-                HumanMessage(content="我想生成图片"),
-                AIMessage(content="请告诉我您想要生成什么样的图片？"),
-                HumanMessage(content="夕阳下看大海的少女"),
-                AIMessage(content="图片已生成完成"),
-            ],
-        }
-        intent = main_agent._classify_intent(state, "真好看")
-        assert intent == Intent.CHAT
-        print(f"生图后切回聊天: {intent}")
-
-    def test_keep_image_intent_in_conversation(self, main_agent):
-        """测试：生图对话中，用户继续提供描述，保持IMAGE意图"""
-        state = {
-            "messages": [
-                HumanMessage(content="我想生成图片"),
-                AIMessage(content="请告诉我您想要生成什么样的图片？"),
-            ],
-        }
-        intent = main_agent._classify_intent(state, "夕阳下看大海的少女")
-        assert intent == Intent.IMAGE
-        print(f"生图对话中保持: {intent}")
+    def test_image_subagent_registered(self, main_agent):
+        """测试生图子Agent已注册到注册表"""
+        assert main_agent.subagent_registry.get("image") is not None
 
 
 # ============== 测试：子Agent标准化接口 ==============
@@ -213,7 +184,7 @@ class TestMainAgentIntegration:
         assert "请告诉我" in result["messages"][0].content or "描述" in result["messages"][0].content
         print(f"委派生图: {result['messages'][0].content[:60]}...")
 
-    def test_chat_after_image_context(self, main_agent):
+    def test_chat_after_image_generation(self, main_agent):
         """测试：生图对话历史存在时，用户说无关内容，主Agent直接聊天"""
         messages = [
             HumanMessage(content="我想生成图片"),
@@ -288,45 +259,24 @@ def run_all_tests():
     print("HuesaeAgents 架构重构测试")
     print("=" * 60)
 
-    # 1. 主Agent意图分类
-    print("\n--- 测试1: 主Agent意图分类 ---")
+    # 1. 主Agent工具注册
+    print("\n--- 测试1: 主Agent工具注册 ---")
     main = HuesaeMainAgent(llm=llm)
     main.register_sub_agent(create_image_agent(llm=llm))
 
-    intent = main._classify_intent({}, "我想生成图片")
-    print(f"✓ 生图意图: {intent}")
+    tool_names = {tool.name for tool in main.tools}
+    print(f"✓ 可用工具: {sorted(tool_names)}")
+    assert "task_tool" in tool_names
+    assert main.subagent_registry.get("image") is not None
 
-    intent = main._classify_intent({}, "今天天气怎么样")
-    print(f"✓ 聊天意图: {intent}")
-
-    # 2. 生图对话中保持意图
-    state = {
-        "messages": [
-            HumanMessage(content="我想生成图片"),
-            AIMessage(content="请描述一下？"),
-        ],
-    }
-    intent = main._classify_intent(state, "夕阳下看大海的少女")
-    print(f"✓ 生图对话保持: {intent}")
-
-    # 3. 生图后切回聊天
-    state = {
-        "messages": [
-            HumanMessage(content="我想生成图片"),
-            AIMessage(content="图片已生成完成~"),
-        ],
-    }
-    intent = main._classify_intent(state, "真好看")
-    print(f"✓ 生图后切回聊天: {intent}")
-
-    # 4. 子Agent标准化接口
+    # 2. 子Agent标准化接口
     print("\n--- 测试2: 子Agent标准化接口 ---")
     image_agent = ImageSubAgent(llm=llm, providers=[])
     result = image_agent.process({}, "我想生成图片")
     print(f"✓ 追问: action={result['action']}")
     assert "action" in result and "response" in result
 
-    # 5. 主Agent集成
+    # 3. 主Agent集成
     print("\n--- 测试3: 主Agent集成 ---")
     result = main.process({"messages": []}, "你好")
     print(f"✓ 直接聊天: {result['messages'][0].content[:40]}...")

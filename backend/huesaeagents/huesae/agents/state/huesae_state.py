@@ -1,59 +1,36 @@
-"""Huesae 对话状态类
+"""Huesae 对话状态类。
 
-显式记录当前意图，替代从历史消息推断状态的方式。
-
-Example:
-    >>> from state.huesae_state import HuesaeState
-    >>> state = HuesaeState()
-    >>> state.messages.append(HumanMessage(content="你好"))
-    >>> state.intent = "chat"
-    >>> state.image_intent = "generate_image"
-    >>> data = state.to_dict()
-    >>> restored = HuesaeState.from_dict(data)
+仅保存当前运行时需要的主对话历史和活跃子Agent上下文。
 """
-from typing import Any
 
 
 class HuesaeState:
-    """Huesae 对话状态
+    """Huesae 对话状态。
 
     Attributes:
-        messages: 主对话历史（只保留核心业务消息）
-        image_context: 生图Agent子对话历史（隔离中间追问/扩写等过程）
-        intent: 当前主意图（chat/image/voice/memory/search/remind）
-        image_intent: image 意图下的子分类（generate_image/expand_prompt/convert_tags）
+        messages: 主对话历史。
+        active_subagent: 当前活跃的子Agent上下文。
     """
 
     def __init__(self):
         self.messages: list = []
-        self.image_context: list = []  # 生图Agent子上下文
-        self.intent: str | None = None
-        self.image_intent: str | None = None
-        self.current_image_prompt: str | None = None  # 当前确认的提示词（用于换图）
+        self.active_subagent: dict | None = None
 
     def to_dict(self) -> dict:
-        """序列化为字典"""
+        """序列化为字典。"""
         return {
             "messages": self.messages,
-            "image_context": self.image_context,
-            "intent": self.intent,
-            "image_intent": self.image_intent,
-            "current_image_prompt": self.current_image_prompt,
+            "active_subagent": self.active_subagent,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "HuesaeState":
-        """从字典恢复状态"""
+        """从字典恢复状态。"""
         state = cls()
         state.messages = data.get("messages", [])
-        state.image_context = data.get("image_context", [])
-        state.intent = data.get("intent")
-        state.image_intent = data.get("image_intent")
-        state.current_image_prompt = data.get("current_image_prompt")
+        state.active_subagent = data.get("active_subagent")
         return state
 
-    def clear_image(self) -> None:
-        """清除 image 相关状态（子Agent完成时调用）"""
-        self.image_intent = None
-        self.image_context = []
-        self.current_image_prompt = None
+    def clear_subagent(self) -> None:
+        """清除当前活跃子Agent。"""
+        self.active_subagent = None
