@@ -134,28 +134,30 @@ class DoubaoClient:
             "raw": response.model_dump(),
         }
 
-    def generate_images_stream(
+    def generate_images(
         self,
         prompt: str,
         size: str = "2K",
-        max_images: int = 4,
+        max_images: int = 12,
         watermark: bool = False,
+        response_format: str = "url",
         output_format: str = "jpeg",
         timeout: int = 300,
-    ) -> Generator[str, None, None]:
+    ) -> list[dict]:
         """
-        流式生成一组图片（最多4张）
+        生成一组图片（组图模式，非流式）
 
         Args:
             prompt: 提示词，需描述生成一组连贯图片
             size: 图片尺寸，默认 2K
-            max_images: 最大图片数量，默认4
+            max_images: 最大图片数量，默认12
             watermark: 是否添加水印，默认 False
+            response_format: 返回格式，url 或 b64_json，默认 url
             output_format: 输出图片格式，支持 jpeg/png，默认 jpeg
             timeout: 超时时间（秒）
 
-        Yields:
-            str: 每张图片的 base64 JSON
+        Returns:
+            list[dict]: 每张图片的信息列表，每个元素包含 url/b64_json/size
 
         Raises:
             DoubaoImageError: 生成失败时抛出
@@ -165,7 +167,67 @@ class DoubaoClient:
                 model=self.MODEL,
                 prompt=prompt,
                 size=size,
-                response_format="b64_json",
+                response_format=response_format,
+                extra_body={
+                    "watermark": watermark,
+                    "sequential_image_generation": "auto",
+                    "sequential_image_generation_options": {
+                        "max_images": max_images,
+                    },
+                    "output_format": output_format,
+                },
+                timeout=timeout,
+            )
+
+            results = []
+            for image in response.data:
+                result = {
+                    "url": image.url if hasattr(image, "url") else None,
+                    "b64_json": image.b64_json if hasattr(image, "b64_json") else None,
+                    "size": image.size if hasattr(image, "size") else None,
+                }
+                results.append(result)
+            return results
+
+        except Exception as e:
+            if isinstance(e, DoubaoImageError):
+                raise
+            raise DoubaoImageError(-1, str(e))
+
+    def generate_images_stream(
+        self,
+        prompt: str,
+        size: str = "2K",
+        max_images: int = 12,
+        watermark: bool = False,
+        response_format: str = "url",
+        output_format: str = "jpeg",
+        timeout: int = 300,
+    ) -> Generator[str, None, None]:
+        """
+        流式生成一组图片（最多12张）
+
+        Args:
+            prompt: 提示词，需描述生成一组连贯图片
+            size: 图片尺寸，默认 2K
+            max_images: 最大图片数量，默认12
+            watermark: 是否添加水印，默认 False
+            response_format: 返回格式，url 或 b64_json，默认 url
+            output_format: 输出图片格式，支持 jpeg/png，默认 jpeg
+            timeout: 超时时间（秒）
+
+        Yields:
+            str: 每张图片的 URL 或 base64 JSON
+
+        Raises:
+            DoubaoImageError: 生成失败时抛出
+        """
+        try:
+            response = self.client.images.generate(
+                model=self.MODEL,
+                prompt=prompt,
+                size=size,
+                response_format=response_format,
                 stream=True,
                 extra_body={
                     "watermark": watermark,
@@ -182,7 +244,9 @@ class DoubaoClient:
                 if event is None:
                     continue
                 elif event.type == "image_generation.partial_succeeded":
-                    if event.b64_json is not None:
+                    if response_format == "url" and event.url is not None:
+                        yield event.url
+                    elif event.b64_json is not None:
                         yield event.b64_json
                 elif event.type == "image_generation.completed":
                     # 流式生成结束，不再 yield

@@ -37,6 +37,7 @@ class ImageDecision(BaseModel):
     provider: str | None = Field(default=None, description="选择的生图工具（当前固定doubao）")
     size: str | None = Field(default="2K", description="图片尺寸，支持 1K, 2K, 3K, 4K 等")
     output_format: str | None = Field(default="jpeg", description="输出图片格式，支持 jpeg, png")
+    is_batch: bool | None = Field(default=False, description="是否使用组图模式，用户明确说明生成数量（如生成4张）时为true")
 
 
 # ============== 标准化返回格式 ==============
@@ -245,6 +246,7 @@ class ImageSubAgent(BaseSubAgent):
             provider="doubao",
             size=decision.size or "2K",
             output_format=decision.output_format or "jpeg",
+            is_batch=decision.is_batch or False,
         )
 
     # ============== 生图执行 ==============
@@ -282,6 +284,57 @@ class ImageSubAgent(BaseSubAgent):
             size=size,
             output_format=output_format,
         )
+
+    # ============== 组图生成 ==============
+
+    async def generate_images(
+        self,
+        prompt: str,
+        provider_name: str | None = None,
+        size: str = "2K",
+        output_format: str = "jpeg",
+    ) -> list[GenerationResult]:
+        """调用Provider生成组图（非流式）
+
+        Args:
+            prompt: 提示词（自然语言）
+            provider_name: Provider名称，默认doubao
+            size: 图片尺寸，默认 2K
+            output_format: 输出格式，默认 jpeg
+
+        Returns:
+            list[GenerationResult]: 生成结果列表
+        """
+        import asyncio
+        provider_name = provider_name or self.default_provider
+
+        if provider_name not in self.providers:
+            available = list(self.providers.keys())
+            raise ValueError(
+                f"Unknown provider: {provider_name}. "
+                f"Available: {available}"
+            )
+
+        provider = self.providers[provider_name]
+        try:
+            from huesaeagents.huesae.tools.doubao import create_doubao_client
+        except ImportError:
+            from ..tools.doubao import create_doubao_client
+
+        client = create_doubao_client()
+        images = await asyncio.to_thread(
+            client.generate_images,
+            prompt=prompt,
+            size=size,
+            max_images=12,
+            output_format=output_format,
+        )
+
+        return [
+            GenerationResult(url=img["url"], provider=provider.name, prompt=prompt, size=size)
+            for img in images
+            if img.get("url")
+        ]
 
     # ============== 便捷方法 ==============
 

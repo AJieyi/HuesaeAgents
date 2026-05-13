@@ -112,6 +112,7 @@ def run_chat_loop():
             prompt = result.get("prompt", "")
             size = result.get("size", "2K")
             output_format = result.get("output_format", "jpeg")
+            is_batch = result.get("is_batch", False)
             print_stream("图片正在生成中，请稍等~")
             print()
 
@@ -126,14 +127,19 @@ def run_chat_loop():
                     prompt=prompt,
                     size=size,
                     output_format=output_format,
+                    is_batch=is_batch,
                 ))
 
                 # 流式打印包装语
                 print_stream(image_result["wrap_message"])
                 print()
 
-                # 显示图片URL
-                print(f"[图片] {image_result['image_url']}\n")
+                # 显示图片URL（单图或组图）
+                if image_result.get("image_urls"):
+                    for url in image_result["image_urls"]:
+                        print(f"[图片] {url}\n")
+                else:
+                    print(f"[图片] {image_result['image_url']}\n")
 
                 # 生图完成后更新主对话历史（包装语作为AI回复）
                 conv_state.messages.append(AIMessage(content=image_result["wrap_message"]))

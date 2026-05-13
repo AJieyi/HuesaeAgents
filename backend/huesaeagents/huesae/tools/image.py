@@ -198,11 +198,12 @@ async def generate_images_by_doubao(
         size: 图片尺寸，支持 1K, 2K, 4K 等，默认 2K
         max_images: 最大图片数量，默认 10
         watermark: 是否添加水印，默认 False
+        response_format: 返回格式，url 或 b64_json，默认 url
         output_format: 输出图片格式，支持 jpeg/png，默认 jpeg
         timeout: 超时时间（秒），默认 300
 
     Returns:
-        图片 base64 JSON 列表
+        图片 URL 或 base64 JSON 列表
 
     Raises:
         DoubaoImageError: 生成失败时抛出
@@ -214,15 +215,21 @@ async def generate_images_by_doubao(
         ... )
         >>> print(f"生成了 {len(images)} 张图片")
     """
-    return await doubao_generate_images(
-        prompt=prompt,
-        size=size,
-        max_images=max_images,
-        watermark=watermark,
-        response_format=response_format,
-        output_format=output_format,
-        timeout=timeout,
-    )
+    import asyncio
+    client = create_doubao_client()
+
+    def _generate():
+        return list(client.generate_images_stream(
+            prompt=prompt,
+            size=size,
+            max_images=max_images,
+            watermark=watermark,
+            response_format=response_format,
+            output_format=output_format,
+            timeout=timeout,
+        ))
+
+    return await asyncio.to_thread(_generate)
 
 
 # 保持向后兼容

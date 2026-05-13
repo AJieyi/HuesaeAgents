@@ -233,6 +233,7 @@ class HuesaeMainAgent:
             # 从子Agent结果中获取生图参数
             size = sub_result.get("size", "2K")
             output_format = sub_result.get("output_format", "jpeg")
+            is_batch = sub_result.get("is_batch", False)
             # 将本轮对话追加到子上下文（保留历史，用于后续换图/扩写）
             image_context.append(HumanMessage(content=user_input))
             image_context.append(
@@ -246,6 +247,7 @@ class HuesaeMainAgent:
                 "prompt": prompt,
                 "size": size,
                 "output_format": output_format,
+                "is_batch": is_batch,
                 "image_intent": image_intent,
                 "image_context": image_context,
             }
@@ -280,6 +282,7 @@ class HuesaeMainAgent:
         prompt: str,
         size: str = "2K",
         output_format: str = "jpeg",
+        is_batch: bool = False,
     ) -> dict:
         """执行生图并返回结果（供外部调用）
 
@@ -287,21 +290,33 @@ class HuesaeMainAgent:
             prompt: 生图提示词
             size: 图片尺寸，默认 2K
             output_format: 输出格式，默认 jpeg
+            is_batch: 是否使用组图模式，默认 False
 
         Returns:
-            dict: {wrap_message, image_url} 或抛出异常
+            dict: 单图时 {wrap_message, image_url}，组图时 {wrap_message, image_urls}，或抛出异常
         """
         agent = self.sub_agents.get(Intent.IMAGE)
         if not agent:
             raise ValueError("Image agent not registered")
+
+        wrap_msg = self._create_wrap_message()
+
+        if is_batch:
+            generations = await agent.generate_images(
+                prompt=prompt,
+                size=size,
+                output_format=output_format,
+            )
+            return {
+                "wrap_message": wrap_msg,
+                "image_urls": [g.url for g in generations],
+            }
 
         generation = await agent.generate_image(
             prompt=prompt,
             size=size,
             output_format=output_format,
         )
-        wrap_msg = self._create_wrap_message()
-
         return {
             "wrap_message": wrap_msg,
             "image_url": generation.url,
