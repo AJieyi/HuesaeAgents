@@ -110,6 +110,8 @@ def run_chat_loop():
         # 处理待执行的生图
         if result.get("pending_generation"):
             prompt = result.get("prompt", "")
+            size = result.get("size", "2K")
+            output_format = result.get("output_format", "jpeg")
             print_stream("图片正在生成中，请稍等~")
             print()
 
@@ -120,7 +122,11 @@ def run_chat_loop():
 
             try:
                 # 异步执行生图
-                image_result = asyncio.run(main_agent.execute_image_generation(prompt))
+                image_result = asyncio.run(main_agent.execute_image_generation(
+                    prompt=prompt,
+                    size=size,
+                    output_format=output_format,
+                ))
 
                 # 流式打印包装语
                 print_stream(image_result["wrap_message"])

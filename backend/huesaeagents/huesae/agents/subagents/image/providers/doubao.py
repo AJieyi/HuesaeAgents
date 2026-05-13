@@ -7,9 +7,9 @@ import os
 from .base import ImageProvider, GenerationResult
 
 try:
-    from huesae.tools.image import generate_image_by_doubao
+    from .client import DoubaoClient, DoubaoImageError, create_doubao_client
 except ImportError:
-    from huesaeagents.huesae.tools.image import generate_image_by_doubao
+    from huesaeagents.huesae.tools.doubao.client import DoubaoClient, DoubaoImageError, create_doubao_client
 
 
 class DoubaoProvider(ImageProvider):
@@ -27,21 +27,27 @@ class DoubaoProvider(ImageProvider):
         self,
         prompt: str,
         size: str = "2K",
+        output_format: str = "jpeg",
         **kwargs,
     ) -> GenerationResult:
         """调用豆包API生成图片
 
         Args:
             prompt: 提示词（Danbooru标签拼接）
-            size: 图片尺寸，支持 1K, 2K, 4K
+            size: 图片尺寸，支持 1K, 2K, 3K, 4K
+            output_format: 输出图片格式，支持 jpeg, png
             **kwargs: 额外参数
 
         Returns:
             GenerationResult: 包含图片URL的生成结果
         """
-        url = await generate_image_by_doubao(
+        import asyncio
+        client = create_doubao_client()
+        url = await asyncio.to_thread(
+            client.generate_image,
             prompt=prompt,
             size=size,
+            output_format=output_format,
         )
         return GenerationResult(
             url=url,

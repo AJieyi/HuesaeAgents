@@ -2,9 +2,9 @@
 from langchain.tools import tool
 
 try:
-    from ..tools.image import generate_image_by_jimeng, generate_image_by_doubao, generate_images_by_doubao
+    from ..tools.image import generate_image_by_jimeng, generate_image_by_doubao
 except ImportError:
-    from huesaeagents.huesae.tools.image import generate_image_by_jimeng, generate_image_by_doubao, generate_images_by_doubao
+    from huesaeagents.huesae.tools.image import generate_image_by_jimeng, generate_image_by_doubao
 
 
 @tool
@@ -53,34 +53,34 @@ async def generate_image_doubao(
     )
 
 
-@tool
-async def generate_images_doubao(
-    prompt: str,
-    size: str = "2K",
-    watermark: bool = False,
-    response_format: str = "url",
-    output_format: str = "jpeg",
-) -> str:
-    """
-    生成一组图片（豆包，组图模式）
+# @tool
+# async def generate_images_doubao(
+#     prompt: str,
+#     size: str = "2K",
+#     watermark: bool = False,
+#     response_format: str = "url",
+#     output_format: str = "jpeg",
+# ) -> str:
+#     """
+#     生成一组图片（豆包，组图模式）
 
-    Args:
-        prompt: 提示词，需描述生成一组连贯图片，如 "生成一组共4张连贯插画，核心为同一庭院一角的四季变迁"
-        size: 图片尺寸，支持 1K, 2K, 4K 等，默认 2K
-        watermark: 是否添加水印，默认 False
-        output_format: 输出图片格式，支持 jpeg/png，默认 jpeg
+#     Args:
+#         prompt: 提示词，需描述生成一组连贯图片，如 "生成一组共4张连贯插画，核心为同一庭院一角的四季变迁"
+#         size: 图片尺寸，支持 1K, 2K, 4K 等，默认 2K
+#         watermark: 是否添加水印，默认 False
+#         output_format: 输出图片格式，支持 jpeg/png，默认 jpeg
 
-    Returns:
-        图片 base64 JSON 列表
-    """
-    return await generate_images_by_doubao(
-        prompt=prompt,
-        size=size,
-        watermark=watermark,
-        response_format=response_format,
-        output_format=output_format,
-    )
+#     Returns:
+#         图片 base64 JSON 列表
+#     """
+#     return await generate_images_by_doubao(
+#         prompt=prompt,
+#         size=size,
+#         watermark=watermark,
+#         response_format=response_format,
+#         output_format=output_format,
+#     )
 
 
 # 导出所有工具
-IMAGE_TOOLS = [generate_image_jimeng, generate_image_doubao, generate_images_doubao]
+IMAGE_TOOLS = [generate_image_jimeng, generate_image_doubao]

@@ -8,7 +8,6 @@ try:
         DoubaoClient,
         DoubaoImageError,
         create_doubao_client,
-        generate_images_by_doubao as doubao_generate_images,
     )
 except ImportError:
     from huesaeagents.huesae.tools.jimeng import JimengClient, JimengAIError, create_jimeng_client
@@ -16,7 +15,6 @@ except ImportError:
         DoubaoClient,
         DoubaoImageError,
         create_doubao_client,
-        generate_images_by_doubao as doubao_generate_images,
     )
 
 

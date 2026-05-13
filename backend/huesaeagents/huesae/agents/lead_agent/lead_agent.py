@@ -230,6 +230,9 @@ class HuesaeMainAgent:
         if action == "generate":
             # 使用子Agent返回的 prompt，如果没有则使用上一次保存的 prompt（换图场景）
             prompt = sub_result.get("prompt") or state.get("current_image_prompt", "")
+            # 从子Agent结果中获取生图参数
+            size = sub_result.get("size", "2K")
+            output_format = sub_result.get("output_format", "jpeg")
             # 将本轮对话追加到子上下文（保留历史，用于后续换图/扩写）
             image_context.append(HumanMessage(content=user_input))
             image_context.append(
@@ -241,6 +244,8 @@ class HuesaeMainAgent:
                 ],
                 "pending_generation": True,
                 "prompt": prompt,
+                "size": size,
+                "output_format": output_format,
                 "image_intent": image_intent,
                 "image_context": image_context,
             }
@@ -270,11 +275,18 @@ class HuesaeMainAgent:
             "image_context": image_context,
         }
 
-    async def execute_image_generation(self, prompt: str) -> dict:
+    async def execute_image_generation(
+        self,
+        prompt: str,
+        size: str = "2K",
+        output_format: str = "jpeg",
+    ) -> dict:
         """执行生图并返回结果（供外部调用）
 
         Args:
             prompt: 生图提示词
+            size: 图片尺寸，默认 2K
+            output_format: 输出格式，默认 jpeg
 
         Returns:
             dict: {wrap_message, image_url} 或抛出异常
@@ -283,7 +295,11 @@ class HuesaeMainAgent:
         if not agent:
             raise ValueError("Image agent not registered")
 
-        generation = await agent.generate_image(prompt)
+        generation = await agent.generate_image(
+            prompt=prompt,
+            size=size,
+            output_format=output_format,
+        )
         wrap_msg = self._create_wrap_message()
 
         return {

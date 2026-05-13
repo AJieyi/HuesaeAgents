@@ -35,6 +35,8 @@ class ImageDecision(BaseModel):
     response: str = Field(description="给用户的回复消息，用温柔可爱的二次元语气")
     prompt: str | None = Field(default=None, description="当前确认的提示词")
     provider: str | None = Field(default=None, description="选择的生图工具（当前固定doubao）")
+    size: str | None = Field(default="2K", description="图片尺寸，支持 1K, 2K, 3K, 4K 等")
+    output_format: str | None = Field(default="jpeg", description="输出图片格式，支持 jpeg, png")
 
 
 # ============== 标准化返回格式 ==============
@@ -241,6 +243,8 @@ class ImageSubAgent(BaseSubAgent):
             response=decision.response or "图片正在生成中，请稍等~",
             prompt=prompt,
             provider="doubao",
+            size=decision.size or "2K",
+            output_format=decision.output_format or "jpeg",
         )
 
     # ============== 生图执行 ==============
@@ -249,12 +253,16 @@ class ImageSubAgent(BaseSubAgent):
         self,
         prompt: str,
         provider_name: str | None = None,
+        size: str = "2K",
+        output_format: str = "jpeg",
     ) -> GenerationResult:
         """调用Provider生成图片
 
         Args:
             prompt: 提示词（自然语言）
             provider_name: Provider名称，默认doubao
+            size: 图片尺寸，默认 2K
+            output_format: 输出格式，默认 jpeg
 
         Returns:
             GenerationResult: 生成结果
@@ -269,7 +277,11 @@ class ImageSubAgent(BaseSubAgent):
             )
 
         provider = self.providers[provider_name]
-        return await provider.generate(prompt=prompt)
+        return await provider.generate(
+            prompt=prompt,
+            size=size,
+            output_format=output_format,
+        )
 
     # ============== 便捷方法 ==============
 
