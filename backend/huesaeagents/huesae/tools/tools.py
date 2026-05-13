@@ -97,12 +97,12 @@ def create_tools(
     # 延迟导入避免循环依赖。
     try:
         from huesaeagents.huesae.tools.doubao import create_doubao_client
-        from huesaeagents.huesae.agents.subagents.image import expand_prompt
-        from huesaeagents.huesae.agents.subagents.image.prompts import DANBOORU_SYSTEM_MESSAGE
+        from huesaeagents.huesae.subagents.image import expand_prompt
+        from huesaeagents.huesae.subagents.image.prompts import DANBOORU_SYSTEM_MESSAGE
     except ImportError:
         from .doubao import create_doubao_client
-        from ..agents.subagents.image import expand_prompt
-        from ..agents.subagents.image.prompts import DANBOORU_SYSTEM_MESSAGE
+        from ..subagents.image import expand_prompt
+        from ..subagents.image.prompts import DANBOORU_SYSTEM_MESSAGE
 
     @tool
     def generate_image_tool(prompt: str, size: str = "2K", output_format: str = "jpeg") -> str:

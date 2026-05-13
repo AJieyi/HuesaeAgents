@@ -2,14 +2,15 @@
 
 对接已有的 huesae.tools.jimeng 工具
 """
+import asyncio
 import os
 
 from .base import ImageProvider, GenerationResult
 
 try:
-    from huesae.tools.image import generate_image_by_jimeng
+    from huesae.tools.jimeng import create_jimeng_client
 except ImportError:
-    from huesaeagents.huesae.tools.image import generate_image_by_jimeng
+    from huesaeagents.huesae.tools.jimeng import create_jimeng_client
 
 
 class JimengProvider(ImageProvider):
@@ -46,11 +47,16 @@ class JimengProvider(ImageProvider):
         }
         width, height = size_map.get(size, (2048, 2048))
 
-        url = await generate_image_by_jimeng(
-            prompt=prompt,
-            width=width,
-            height=height,
+        client = create_jimeng_client()
+        image_urls = await asyncio.to_thread(
+            client.generate_image,
+            prompt,
+            width,
+            height,
         )
+        if not image_urls:
+            raise ValueError("即梦没有返回图片地址")
+        url = image_urls[0]
         return GenerationResult(
             url=url,
             provider=self.name,

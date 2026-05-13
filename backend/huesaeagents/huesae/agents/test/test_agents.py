@@ -17,12 +17,12 @@ import pytest
 from langchain_core.messages import HumanMessage, AIMessage
 
 from huesaeagents.huesae.agents.lead_agent import HuesaeMainAgent
-from huesaeagents.huesae.agents.subagents.image_agent import (
+from huesaeagents.huesae.subagents.image_agent import (
     ImageSubAgent,
     ImageDecision,
     create_image_agent,
 )
-from huesaeagents.huesae.agents.subagents.image import (
+from huesaeagents.huesae.subagents.image import (
     generate_tags,
     expand_prompt,
     DoubaoProvider,
@@ -214,7 +214,7 @@ class TestDanbooruTags:
 
     def test_tags_to_prompt(self):
         """测试标签拼接为提示词"""
-        from huesaeagents.huesae.agents.subagents.image import tags_to_prompt
+        from huesaeagents.huesae.subagents.image import tags_to_prompt
         tags = ["1girl", "silver hair", "red eyes"]
         prompt = tags_to_prompt(tags)
         assert prompt == "1girl, silver hair, red eyes"

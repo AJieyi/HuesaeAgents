@@ -13,9 +13,9 @@
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
+from ...subagents.base import BaseSubAgent
 from ...subagents.registry import SubAgentRegistry
 from ...tools.tools import Action, create_tools, parse_subagent_task
-from ..subagents.base import BaseSubAgent
 
 
 # ============== 安全检查 ==============
@@ -79,7 +79,7 @@ class HuesaeMainAgent:
 
     Example:
         >>> from huesae.models.models_factory import create_chat_model
-        >>> from huesae.agents.subagents.image_agent import create_image_agent
+        >>> from huesae.subagents.image_agent import create_image_agent
         >>> main = HuesaeMainAgent(llm=create_chat_model("deepseek"))
         >>> main.register_sub_agent(create_image_agent())
         >>> result = main.process({"messages": []}, "生成一张夕阳下的大海")

@@ -58,7 +58,7 @@ def run_chat_loop():
     - 输入 exit/quit 退出
     """
     from .lead_agent import create_main_agent
-    from ..subagents.image_agent import create_image_agent
+    from ...subagents.image_agent import create_image_agent
     from ..state_manager import StateManager
 
     # 创建主Agent并注册子Agent

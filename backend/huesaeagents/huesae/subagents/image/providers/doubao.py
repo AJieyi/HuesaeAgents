@@ -7,9 +7,9 @@ import os
 from .base import ImageProvider, GenerationResult
 
 try:
-    from .client import DoubaoClient, DoubaoImageError, create_doubao_client
+    from huesae.tools.doubao import DoubaoClient, DoubaoImageError, create_doubao_client
 except ImportError:
-    from huesaeagents.huesae.tools.doubao.client import DoubaoClient, DoubaoImageError, create_doubao_client
+    from huesaeagents.huesae.tools.doubao import DoubaoClient, DoubaoImageError, create_doubao_client
 
 
 class DoubaoProvider(ImageProvider):
