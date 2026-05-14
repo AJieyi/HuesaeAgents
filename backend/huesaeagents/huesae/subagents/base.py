@@ -28,10 +28,10 @@ class BaseSubAgent(ABC):
                 - provider: str | None - 选择的生图工具
                 - data: dict - 额外数据（扩展用）
         """
-        pass
+        raise NotImplementedError
 
     @property
     @abstractmethod
     def name(self) -> str:
         """子Agent名称，用于注册和识别"""
-        pass
+        raise NotImplementedError

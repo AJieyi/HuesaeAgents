@@ -8,9 +8,9 @@ import os
 from .base import ImageProvider, GenerationResult
 
 try:
-    from huesae.tools.jimeng import create_jimeng_client
+    from huesae.tools.jimeng import JimengClient, create_jimeng_client
 except ImportError:
-    from huesaeagents.huesae.tools.jimeng import create_jimeng_client
+    from huesaeagents.huesae.tools.jimeng import JimengClient, create_jimeng_client
 
 
 class JimengProvider(ImageProvider):
@@ -47,7 +47,7 @@ class JimengProvider(ImageProvider):
         }
         width, height = size_map.get(size, (2048, 2048))
 
-        client = create_jimeng_client()
+        client = self._create_client()
         image_urls = await asyncio.to_thread(
             client.generate_image,
             prompt,
@@ -63,3 +63,9 @@ class JimengProvider(ImageProvider):
             prompt=prompt,
             size=f"{width}x{height}",
         )
+
+    def _create_client(self) -> JimengClient:
+        """创建即梦客户端，优先使用显式传入的 AK/SK。"""
+        if self.access_key and self.secret_key:
+            return JimengClient(self.access_key, self.secret_key)
+        return create_jimeng_client()

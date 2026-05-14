@@ -30,7 +30,7 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain.messages import HumanMessage, AIMessage
 
 
 def print_stream(text: str, prefix: str = "AI: ", delay: float = 0.025) -> None:
@@ -59,16 +59,14 @@ def run_chat_loop():
     """
     from .lead_agent import create_main_agent
     from ...subagents.image_agent import create_image_agent
-    from ..state_manager import StateManager
 
     # 创建主Agent并注册子Agent
     main_agent = create_main_agent()
     main_agent.register_sub_agent(create_image_agent())
 
-    # 使用状态管理器（仅内存存储）
-    state_manager = StateManager()
-    session_id = "terminal_user"
-    conv_state = state_manager.get_state(session_id)
+    # 终端交互只保留当前进程内的临时对话状态。
+    messages = []
+    active_subagent = None
 
     print("=" * 50)
     print("HuesaeAgents 终端交互")
@@ -92,10 +90,9 @@ def run_chat_loop():
         if not user_input:
             continue
 
-        # 构建 state dict（从 StateManager 读取当前状态）
         state = {
-            "messages": conv_state.messages,
-            "active_subagent": conv_state.active_subagent,
+            "messages": messages,
+            "active_subagent": active_subagent,
         }
 
         # 调用主Agent（ReAct 循环）
@@ -160,19 +157,13 @@ def run_chat_loop():
 
         # 更新子Agent状态
         if "active_subagent" in result:
-            conv_state.active_subagent = result["active_subagent"]
+            active_subagent = result["active_subagent"]
         if result.get("clear_subagent"):
-            conv_state.active_subagent = None
+            active_subagent = None
 
         # 更新主对话历史
-        conv_state.messages.append(HumanMessage(content=user_input))
-        conv_state.messages.extend(result.get("messages", []))
-
-        # 持久化状态
-        state_manager.save_state(session_id)
-
-    # 退出时清除持久化状态
-    state_manager.clear_state(session_id)
+        messages.append(HumanMessage(content=user_input))
+        messages.extend(result.get("messages", []))
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@
 与Danbooru标签生成不同，扩写的是自然语言。
 """
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage
+from langchain.messages import HumanMessage
 
 
 DEFAULT_EXPAND_PROMPT = """你是一个专业的AI绘画提示词扩写专家。

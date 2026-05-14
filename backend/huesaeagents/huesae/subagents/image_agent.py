@@ -9,7 +9,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage
+from langchain.messages import HumanMessage
 
 from .base import BaseSubAgent
 from .image import expand_prompt
@@ -67,11 +67,8 @@ class ImageSubAgent(BaseSubAgent):
     无状态组件，每次调用接收完整对话历史，用 LLM 分析后输出决策。
     所有回复交给主Agent包装展示。
 
-    Example:
-        >>> agent = ImageSubAgent(llm=create_chat_model("deepseek"))
-        >>> result = agent.process({"messages": [...]}, "我想生成图片")
-        >>> print(result["action"])  # "ask_prompt"
-        >>> print(result["response"])  # "请告诉我您想要生成什么样的图片？..."
+    典型调用：主Agent把完整对话历史和用户最新输入传入 process，
+    子Agent返回统一结果，由主Agent决定是否继续追问或触发生图。
     """
 
     name = "image"
@@ -178,7 +175,7 @@ class ImageSubAgent(BaseSubAgent):
             ])
             return result
         except Exception:
-            # Fallback：任何错误都转为追问
+            # 降级处理：任何决策错误都转为追问，避免中断对话。
             return ImageDecision(
                 thought="LLM决策失败，降级到追问",
                 action="ask_prompt",
@@ -274,8 +271,8 @@ class ImageSubAgent(BaseSubAgent):
         if provider_name not in self.providers:
             available = list(self.providers.keys())
             raise ValueError(
-                f"Unknown provider: {provider_name}. "
-                f"Available: {available}"
+                f"未知生图提供者：{provider_name}。"
+                f"可用提供者：{available}"
             )
 
         provider = self.providers[provider_name]
@@ -305,36 +302,31 @@ class ImageSubAgent(BaseSubAgent):
         Returns:
             list[GenerationResult]: 生成结果列表
         """
-        import asyncio
         provider_name = provider_name or self.default_provider
 
         if provider_name not in self.providers:
             available = list(self.providers.keys())
             raise ValueError(
-                f"Unknown provider: {provider_name}. "
-                f"Available: {available}"
+                f"未知生图提供者：{provider_name}。"
+                f"可用提供者：{available}"
             )
 
         provider = self.providers[provider_name]
-        try:
-            from huesaeagents.huesae.tools.doubao import create_doubao_client
-        except ImportError:
-            from ..tools.doubao import create_doubao_client
+        generate_many = getattr(provider, "generate_images", None)
+        if generate_many is not None:
+            return await generate_many(
+                prompt=prompt,
+                size=size,
+                output_format=output_format,
+            )
 
-        client = create_doubao_client()
-        images = await asyncio.to_thread(
-            client.generate_images,
+        # 非组图 provider 仍可降级生成单张，保证接口返回类型稳定。
+        generation = await provider.generate(
             prompt=prompt,
             size=size,
-            max_images=12,
             output_format=output_format,
         )
-
-        return [
-            GenerationResult(url=img["url"], provider=provider.name, prompt=prompt, size=size)
-            for img in images
-            if img.get("url")
-        ]
+        return [generation]
 
     # ============== 便捷方法 ==============
 

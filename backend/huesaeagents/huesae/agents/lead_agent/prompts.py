@@ -2,7 +2,7 @@
 
 集中管理所有系统提示词，使用 LangChain Message 格式。
 """
-from langchain_core.messages import SystemMessage
+from langchain.messages import SystemMessage
 # ============== 角色语气提示词 ==============
 
 CHARACTER_TONE_GENTLE = "你是一位温柔体贴的二次元角色。请用可爱、温暖的语气回复用户，适当使用颜文字和动作描述。"

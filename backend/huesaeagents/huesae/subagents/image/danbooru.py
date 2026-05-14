@@ -3,7 +3,7 @@
 使用 LLM 将自然语言描述转换为 Danbooru 格式标签
 """
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage
+from langchain.messages import HumanMessage
 
 
 DEFAULT_SYSTEM_PROMPT = """你是一个专业的 Danbooru 标签生成专家。

@@ -3,13 +3,12 @@
 工具选择由 LLM 自主决定，系统只提供工具列表和描述。
 主Agent通过 ReAct 循环让 LLM 自主决策调用哪个工具。
 """
-from dataclasses import dataclass
 from typing import Literal
 
 from langchain.tools import BaseTool, tool
 from pydantic import BaseModel, Field
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage
+from langchain.messages import HumanMessage
 
 from ..subagents.registry import SubAgentRegistry
 
@@ -55,14 +54,11 @@ def parse_subagent_task(result: str) -> tuple[str, str] | None:
     return parts[1], parts[2]
 
 
-@dataclass
 class ToolRegistry:
     """运行时工具注册表。"""
 
-    tools: list[BaseTool]
-
     def __init__(self):
-        self.tools = []
+        self.tools: list[BaseTool] = []
         self._tool_map: dict[str, BaseTool] = {}
 
     def register(self, tool_obj: BaseTool) -> None:

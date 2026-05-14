@@ -3,13 +3,14 @@
 对接已有的 huesae.tools.doubao 工具
 """
 import os
+import asyncio
 
 from .base import ImageProvider, GenerationResult
 
 try:
-    from huesae.tools.doubao import DoubaoClient, DoubaoImageError, create_doubao_client
+    from huesae.tools.doubao import DoubaoClient, create_doubao_client
 except ImportError:
-    from huesaeagents.huesae.tools.doubao import DoubaoClient, DoubaoImageError, create_doubao_client
+    from huesaeagents.huesae.tools.doubao import DoubaoClient, create_doubao_client
 
 
 class DoubaoProvider(ImageProvider):
@@ -41,8 +42,7 @@ class DoubaoProvider(ImageProvider):
         Returns:
             GenerationResult: 包含图片URL的生成结果
         """
-        import asyncio
-        client = create_doubao_client()
+        client = self._create_client()
         url = await asyncio.to_thread(
             client.generate_image,
             prompt=prompt,
@@ -55,3 +55,37 @@ class DoubaoProvider(ImageProvider):
             prompt=prompt,
             size=size,
         )
+
+    async def generate_images(
+        self,
+        prompt: str,
+        size: str = "2K",
+        output_format: str = "jpeg",
+        max_images: int = 12,
+        **kwargs,
+    ) -> list[GenerationResult]:
+        """调用豆包组图接口生成多张图片。"""
+        client = self._create_client()
+        images = await asyncio.to_thread(
+            client.generate_images,
+            prompt=prompt,
+            size=size,
+            max_images=max_images,
+            output_format=output_format,
+        )
+        return [
+            GenerationResult(
+                url=img["url"],
+                provider=self.name,
+                prompt=prompt,
+                size=img.get("size") or size,
+            )
+            for img in images
+            if img.get("url")
+        ]
+
+    def _create_client(self) -> DoubaoClient:
+        """创建豆包客户端，优先使用显式传入的 API Key。"""
+        if self.api_key:
+            return DoubaoClient(api_key=self.api_key)
+        return create_doubao_client()

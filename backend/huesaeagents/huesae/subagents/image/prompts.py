@@ -2,7 +2,7 @@
 
 集中管理所有系统提示词，使用 LangChain Message 格式。
 """
-from langchain_core.messages import SystemMessage
+from langchain.messages import SystemMessage
 
 
 # ============== Danbooru标签生成提示词 ==============
@@ -135,4 +135,3 @@ action说明：
 """
 
 IMAGE_CONVERSATION_SYSTEM_MESSAGE = SystemMessage(content=IMAGE_CONVERSATION_PROMPT)
-

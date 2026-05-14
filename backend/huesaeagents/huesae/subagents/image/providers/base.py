@@ -24,7 +24,7 @@ class ImageProvider(ABC):
     @abstractmethod
     def name(self) -> str:
         """提供者名称，用于注册和选择"""
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     async def generate(
@@ -43,7 +43,7 @@ class ImageProvider(ABC):
         Returns:
             GenerationResult: 生成结果
         """
-        pass
+        raise NotImplementedError
 
     def supports_size(self, size: str) -> bool:
         """检查是否支持指定尺寸（默认支持所有）"""

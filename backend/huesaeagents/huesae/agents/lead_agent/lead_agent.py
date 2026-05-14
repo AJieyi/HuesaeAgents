@@ -11,7 +11,7 @@
 3. 保留子Agent的多轮对话能力（通过 task_tool 委托）
 """
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain.messages import HumanMessage, AIMessage, SystemMessage
 
 from ...subagents.base import BaseSubAgent
 from ...subagents.registry import SubAgentRegistry
@@ -77,13 +77,8 @@ class HuesaeMainAgent:
     - 调用工具
     - 委托子Agent
 
-    Example:
-        >>> from huesae.models.models_factory import create_chat_model
-        >>> from huesae.subagents.image_agent import create_image_agent
-        >>> main = HuesaeMainAgent(llm=create_chat_model("deepseek"))
-        >>> main.register_sub_agent(create_image_agent())
-        >>> result = main.process({"messages": []}, "生成一张夕阳下的大海")
-        >>> print(result["messages"][0].content)
+    典型调用：外层传入 messages 与用户最新输入，主Agent返回新的
+    AIMessage；如果需要异步生图，会额外返回 pending_generation。
     """
 
     MAX_STEPS = 3  # ReAct 循环最大步数
@@ -164,12 +159,12 @@ class HuesaeMainAgent:
                 )
                 action = structured_llm.invoke(messages)
             except Exception:
-                # Fallback：直接聊天
+                # 降级处理：结构化决策失败时直接聊天。
                 chat_response = self._chat_reply(state, user_input)
                 return {"messages": [AIMessage(content=chat_response)]}
 
             if action.type == "reply":
-                return {"messages": [AIMessage(content=action.response)]}
+                return {"messages": [AIMessage(content=action.response or "")]}
 
             if action.type == "tool_call":
                 tool_args = action.tool_args or {}
@@ -195,7 +190,7 @@ class HuesaeMainAgent:
                 # 快速工具：结果加入上下文，继续循环让LLM生成最终回复
                 tool_results.append(result)
 
-        # 超过最大步数，Fallback 到聊天
+        # 超过最大步数后降级到直接聊天。
         chat_response = self._chat_reply(state, user_input)
         return {"messages": [AIMessage(content=chat_response)]}
 
@@ -271,39 +266,7 @@ class HuesaeMainAgent:
             ],
         }
 
-        action = sub_result.get("action", "")
-
-        if action in ("ask_prompt", "recommend", "ask_confirm"):
-            # 子Agent需要继续对话
-            return {
-                "messages": [AIMessage(content=sub_result["response"])],
-                "active_subagent": subagent_context,
-            }
-
-        if action == "generate":
-            # 子Agent决定生图
-            prompt = sub_result.get("prompt", "")
-            return {
-                "messages": [AIMessage(content=sub_result.get("response", "图片正在生成中，请稍等~"))],
-                "pending_generation": True,
-                "prompt": prompt,
-                "size": self._sub_result_data_value(sub_result, "size", "2K"),
-                "output_format": self._sub_result_data_value(sub_result, "output_format", "jpeg"),
-                "is_batch": self._sub_result_data_value(sub_result, "is_batch", False),
-                "active_subagent": subagent_context,
-            }
-
-        if action == "finish":
-            return {
-                "messages": [AIMessage(content=sub_result["response"])],
-                "clear_subagent": True,
-            }
-
-        # 默认
-        return {
-            "messages": [AIMessage(content=sub_result.get("response", "请告诉我您想要生成什么样的图片？"))],
-            "active_subagent": subagent_context,
-        }
+        return self._format_subagent_result(sub_result, subagent_context)
 
     def _handle_subagent(self, state: dict, user_input: str) -> dict:
         """继续子Agent的对话"""
@@ -327,20 +290,24 @@ class HuesaeMainAgent:
         subagent_context["history"] = history
         subagent_context["state"] = sub_state
 
+        return self._format_subagent_result(sub_result, subagent_context)
+
+    def _format_subagent_result(self, sub_result: dict, subagent_context: dict) -> dict:
+        """把子Agent标准结果转换成主Agent对外返回格式。"""
         action = sub_result.get("action", "")
+        response = sub_result.get("response", "")
 
         if action in ("ask_prompt", "recommend", "ask_confirm"):
             return {
-                "messages": [AIMessage(content=sub_result["response"])],
+                "messages": [AIMessage(content=response)],
                 "active_subagent": subagent_context,
             }
 
         if action == "generate":
-            prompt = sub_result.get("prompt", "")
             return {
-                "messages": [AIMessage(content=sub_result.get("response", "图片正在生成中，请稍等~"))],
+                "messages": [AIMessage(content=response or "图片正在生成中，请稍等~")],
                 "pending_generation": True,
-                "prompt": prompt,
+                "prompt": sub_result.get("prompt", ""),
                 "size": self._sub_result_data_value(sub_result, "size", "2K"),
                 "output_format": self._sub_result_data_value(sub_result, "output_format", "jpeg"),
                 "is_batch": self._sub_result_data_value(sub_result, "is_batch", False),
@@ -349,12 +316,12 @@ class HuesaeMainAgent:
 
         if action == "finish":
             return {
-                "messages": [AIMessage(content=sub_result["response"])],
+                "messages": [AIMessage(content=response)],
                 "clear_subagent": True,
             }
 
         return {
-            "messages": [AIMessage(content=sub_result.get("response", ""))],
+            "messages": [AIMessage(content=response or "请告诉我您想要生成什么样的图片？")],
             "active_subagent": subagent_context,
         }
 
