@@ -41,15 +41,15 @@ MAIN_AGENT_SYSTEM_PROMPT = """你是 HuesaeAgents 的主Agent，负责理解用�
 
 ## 工作原则
 1. 仔细分析用户需求，选择最合适的工具或直接回复
-2. 当用户需求明确且简单时，直接调用对应工具（如明确说"生成一张夕阳下的大海"）
-3. 当用户需求模糊或需要多轮对话时，调用 task_tool 委托子Agent处理
+2. 用户需要生图、画图、出图时，优先调用 task_tool 委托 image 子Agent处理确认闭环
+3. 当用户需求模糊或需要多轮对话时，也调用 task_tool 委托子Agent处理
 4. 调用工具后，基于工具结果给用户友好的回复
 5. 每次只能选择一个行动：直接回复 或 调用一个工具
 
 ## 工具选择指南
 - 工具描述是你选择工具的主要依据，优先根据工具名称、参数和描述做决策
-- generate_image_tool: 用户明确要求生成单张图片（"画一只猫"、"生成一张..."）
-- generate_images_tool: 用户明确要求生成多张图片（"生成4张四季插画"、"来一组头像"）
+- generate_image_tool: 低层单图工具，通常由生图子Agent确认后触发；主Agent不要直接用它绕过确认
+- generate_images_tool: 低层组图工具，通常由生图子Agent确认后触发；主Agent不要直接用它绕过确认
 - expand_prompt_tool: 用户要求扩写图片描述（"扩写一下"、"写详细点"）
 - convert_tags_tool: 用户要求转成Danbooru标签（"生成标签"、"转成标签"）
 - task_tool: 用户说"我想生成图片"但没给具体描述、需要推荐、需要多轮确认
@@ -168,16 +168,19 @@ class HuesaeMainAgent:
 
             if action.type == "tool_call":
                 tool_args = action.tool_args or {}
-                # 生图工具：返回 pending_generation，由外层异步执行
+                # 低层生图工具也转入子Agent，避免绕过用户确认闭环。
                 if action.tool_name in ("generate_image_tool", "generate_images_tool"):
-                    return {
-                        "messages": [AIMessage(content="图片正在生成中，请稍等~")],
-                        "pending_generation": True,
-                        "prompt": tool_args.get("prompt", ""),
+                    initial_state = {
                         "size": tool_args.get("size", "2K"),
                         "output_format": tool_args.get("output_format", "jpeg"),
                         "is_batch": action.tool_name == "generate_images_tool",
                     }
+                    return self._start_subagent(
+                        state,
+                        "image",
+                        tool_args.get("prompt", user_input),
+                        initial_state=initial_state,
+                    )
 
                 result = self._execute_tool(action.tool_name, tool_args)
 
@@ -234,7 +237,13 @@ class HuesaeMainAgent:
 
     # ============== 子Agent处理 ==============
 
-    def _start_subagent(self, state: dict, subagent_type: str, description: str) -> dict:
+    def _start_subagent(
+        self,
+        state: dict,
+        subagent_type: str,
+        description: str,
+        initial_state: dict | None = None,
+    ) -> dict:
         """启动子Agent处理任务
         """
         agent = self.subagent_registry.get(subagent_type)
@@ -250,7 +259,10 @@ class HuesaeMainAgent:
         sub_state = {
             "messages": [],
             "image_task_type": "generate_image",
+            "image_phase": "collecting_prompt",
         }
+        if initial_state:
+            sub_state.update(initial_state)
 
         # 调用子Agent
         sub_result = agent.process(sub_state, description)
@@ -265,6 +277,7 @@ class HuesaeMainAgent:
                 AIMessage(content=sub_result.get("response", "")),
             ],
         }
+        self._apply_subagent_state_update(subagent_context, sub_result)
 
         return self._format_subagent_result(sub_result, subagent_context)
 
@@ -283,6 +296,7 @@ class HuesaeMainAgent:
 
         # 调用子Agent
         sub_result = agent.process(sub_state, user_input)
+        self._apply_subagent_state_update(subagent_context, sub_result)
 
         # 更新历史
         history.append(HumanMessage(content=user_input))
@@ -291,6 +305,14 @@ class HuesaeMainAgent:
         subagent_context["state"] = sub_state
 
         return self._format_subagent_result(sub_result, subagent_context)
+
+    @staticmethod
+    def _apply_subagent_state_update(subagent_context: dict, sub_result: dict) -> None:
+        """把子Agent返回的状态更新合并到 active_subagent 中。"""
+        state_update = (sub_result.get("data") or {}).get("state_update") or {}
+        if not state_update:
+            return
+        subagent_context.setdefault("state", {}).update(state_update)
 
     def _format_subagent_result(self, sub_result: dict, subagent_context: dict) -> dict:
         """把子Agent标准结果转换成主Agent对外返回格式。"""
@@ -359,6 +381,12 @@ class HuesaeMainAgent:
             return {
                 "wrap_message": wrap_msg,
                 "image_urls": [g.url for g in generations],
+                "confirm_message": "这些图片可以吗？如果满意请回复“可以”，也可以说“换一组”或重新输入提示词~",
+                "subagent_state_update": {
+                    "image_phase": "awaiting_image_confirm",
+                    "last_image_urls": [g.url for g in generations],
+                    "last_generation_succeeded": True,
+                },
             }
 
         generation = await agent.generate_image(
@@ -369,6 +397,12 @@ class HuesaeMainAgent:
         return {
             "wrap_message": wrap_msg,
             "image_url": generation.url,
+            "confirm_message": "这张图片可以吗？如果满意请回复“可以”，也可以说“换一张”或重新输入提示词~",
+            "subagent_state_update": {
+                "image_phase": "awaiting_image_confirm",
+                "last_image_urls": [generation.url],
+                "last_generation_succeeded": True,
+            },
         }
 
     # ============== 角色语气包装 ==============

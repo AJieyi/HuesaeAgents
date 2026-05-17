@@ -1,15 +1,16 @@
 """生图子Agent
 
 主Agent的委派组件，负责处理生图相关的多轮对话。
-自身无状态，每次根据完整对话历史做决策。
+会把阶段信息写入主Agent维护的子Agent状态中，确保确认闭环稳定。
 
-支持流程：追问 → 推荐 → 扩写 → 确认 → 生图 → 展示 → 结束
+支持流程：追问 → 推荐 → 扩写 → 确认描述 → 生图 → 确认图片 → 结束
 """
-from typing import Literal
+from typing import Literal, TypedDict
 
 from pydantic import BaseModel, Field
 from langchain_core.language_models import BaseChatModel
 from langchain.messages import HumanMessage
+from langgraph.graph import END, START, StateGraph
 
 from .base import BaseSubAgent
 from .image import expand_prompt
@@ -59,6 +60,43 @@ def _make_result(
     }
 
 
+class ImageWorkflowState(TypedDict, total=False):
+    """LangGraph 生图对话状态。"""
+
+    state: dict
+    user_input: str
+    decision: ImageDecision
+    result: dict
+
+
+ImageWorkflowRoute = Literal[
+    "finish_task",
+    "prompt_confirmation",
+    "image_confirmation",
+    "general_decision",
+]
+
+
+_CONFIRM_KEYWORDS = [
+    "可以", "没问题", "就这个", "确认", "行", "好的", "好呀", "生成吧", "开始生成",
+]
+_NEGATIVE_CONFIRM_KEYWORDS = [
+    "不可以", "不行", "不要", "不满意", "不对", "不太行",
+]
+_END_KEYWORDS = [
+    "不用了", "结束吧", "不画了", "先这样", "谢谢不用", "取消",
+]
+_REGENERATE_KEYWORDS = [
+    "换一张", "换一组", "重新生成", "再来一张", "再来一组", "重画",
+]
+_EXPAND_KEYWORDS = [
+    "扩写", "扩展", "写详细", "丰富一下",
+]
+_REPLACE_PROMPT_KEYWORDS = [
+    "重新输入", "新提示词", "换个提示词", "换一个主题", "修改描述",
+]
+
+
 # ============== 生图子Agent ==============
 
 class ImageSubAgent(BaseSubAgent):
@@ -85,6 +123,7 @@ class ImageSubAgent(BaseSubAgent):
             for p in providers:
                 self.register_provider(p)
         self.default_provider = default_provider
+        self.workflow = self._build_workflow()
 
     def register_provider(self, provider: ImageProvider) -> None:
         """注册生图Provider（扩展点）"""
@@ -102,38 +141,258 @@ class ImageSubAgent(BaseSubAgent):
         Returns:
             dict: 标准化结果 {action, response, prompt, provider, data}
         """
-        # 1. LLM决策
-        decision = self._decide(state, user_input)
+        workflow_state = self.workflow.invoke({
+            "state": state,
+            "user_input": user_input,
+        })
+        return workflow_state["result"]
 
-        # 2. 根据action执行对应操作，返回标准化格式
+    # ============== LangGraph 工作流 ==============
+
+    def _build_workflow(self):
+        """构建生图确认流程图。
+
+        LLM 负责理解用户意图，LangGraph 节点负责把确认状态约束住：
+        生成任务确认提示词后必须生图，确认图片后才结束。
+        """
+        workflow = StateGraph(ImageWorkflowState)
+        workflow.add_node("llm_decide", self._workflow_decide)
+        workflow.add_node("finish_task", self._workflow_finish_task)
+        workflow.add_node("prompt_confirmation", self._workflow_prompt_confirmation)
+        workflow.add_node("image_confirmation", self._workflow_image_confirmation)
+        workflow.add_node("general_decision", self._workflow_general_decision)
+        workflow.add_edge(START, "llm_decide")
+        workflow.add_conditional_edges(
+            "llm_decide",
+            self._route_after_decision,
+            {
+                "finish_task": "finish_task",
+                "prompt_confirmation": "prompt_confirmation",
+                "image_confirmation": "image_confirmation",
+                "general_decision": "general_decision",
+            },
+        )
+        workflow.add_edge("finish_task", END)
+        workflow.add_edge("prompt_confirmation", END)
+        workflow.add_edge("image_confirmation", END)
+        workflow.add_edge("general_decision", END)
+        return workflow.compile()
+
+    def _workflow_decide(self, graph_state: ImageWorkflowState) -> dict:
+        """调用 LLM 输出候选决策。"""
+        state = graph_state.get("state", {})
+        user_input = graph_state.get("user_input", "")
+        return {"decision": self._decide(state, user_input)}
+
+    def _route_after_decision(self, graph_state: ImageWorkflowState) -> ImageWorkflowRoute:
+        """按当前阶段路由到对应处理节点。"""
+        state = graph_state.get("state", {})
+        user_input = graph_state.get("user_input", "")
+        phase = state.get("image_phase", "collecting_prompt")
+
+        if self._is_end_request(user_input):
+            return "finish_task"
+
+        if phase == "awaiting_image_confirm":
+            return "image_confirmation"
+
+        if phase == "awaiting_prompt_confirm":
+            return "prompt_confirmation"
+
+        return "general_decision"
+
+    def _workflow_finish_task(self, graph_state: ImageWorkflowState) -> dict:
+        """结束当前生图任务。"""
+        return {"result": _make_result(
+            action="finish",
+            response="好的，那这次生图任务先结束啦~",
+            state_update={"image_phase": "finished"},
+        )}
+
+    def _workflow_prompt_confirmation(self, graph_state: ImageWorkflowState) -> dict:
+        """处理提示词确认阶段。"""
+        state = graph_state.get("state", {})
+        user_input = graph_state.get("user_input", "")
+        decision = graph_state["decision"]
+        return {"result": self._handle_prompt_confirmation_phase(state, user_input, decision)}
+
+    def _workflow_image_confirmation(self, graph_state: ImageWorkflowState) -> dict:
+        """处理图片确认阶段。"""
+        state = graph_state.get("state", {})
+        user_input = graph_state.get("user_input", "")
+        decision = graph_state["decision"]
+        return {"result": self._handle_image_confirmation_phase(state, user_input, decision)}
+
+    def _workflow_general_decision(self, graph_state: ImageWorkflowState) -> dict:
+        """处理尚未进入确认阶段的普通生图决策。"""
+        state = graph_state.get("state", {})
+        user_input = graph_state.get("user_input", "")
+        decision = graph_state["decision"]
+        return {"result": self._result_from_decision(state, user_input, decision)}
+
+    def _result_from_decision(
+        self,
+        state: dict,
+        user_input: str,
+        decision: ImageDecision,
+    ) -> dict:
+        """把 LLM 候选决策转换成带阶段更新的标准结果。"""
         if decision.action == "expand":
-            return self._handle_expand(decision, user_input)
-        elif decision.action == "generate":
-            return self._handle_generate(decision)
-        elif decision.action in ("ask_prompt", "recommend", "ask_confirm"):
+            return self._handle_expand(decision, user_input, state)
+
+        if decision.action == "generate":
+            prompt = decision.prompt or user_input
+            return self._ask_prompt_confirm(
+                prompt=prompt,
+                response=(
+                    f"我理解的图片描述是：\n{prompt}\n\n"
+                    f"需要我帮您扩写得更细一点吗？如果这个描述可以，请回复“可以”，我再开始生图~"
+                ),
+                state=state,
+                decision=decision,
+            )
+
+        if decision.action in ("ask_prompt", "recommend", "ask_confirm"):
+            phase = "collecting_prompt" if decision.action == "ask_prompt" else "awaiting_prompt_confirm"
+            prompt = decision.prompt or state.get("image_prompt")
             return _make_result(
                 action=decision.action,
                 response=decision.response,
-                prompt=decision.prompt,
+                prompt=prompt,
                 provider="doubao",
+                state_update={
+                    "image_phase": phase,
+                    "image_prompt": prompt or "",
+                    "confirmed_prompt": prompt or state.get("confirmed_prompt", ""),
+                    "size": decision.size or state.get("size", "2K"),
+                    "output_format": decision.output_format or state.get("output_format", "jpeg"),
+                    "is_batch": decision.is_batch if decision.is_batch is not None else state.get("is_batch", False),
+                },
             )
-        elif decision.action == "show_image":
+
+        if decision.action == "show_image":
             return _make_result(
                 action="show_image",
                 response=decision.response,
                 prompt=decision.prompt,
                 provider="doubao",
             )
-        elif decision.action == "finish":
+
+        if decision.action == "finish":
             return _make_result(
                 action="finish",
                 response=decision.response,
+                state_update={"image_phase": "finished"},
             )
 
-        # 默认：追问
         return _make_result(
             action="ask_prompt",
             response=decision.response or "请告诉我您想要生成什么样的图片？",
+            state_update={"image_phase": "collecting_prompt"},
+        )
+
+    def _handle_prompt_confirmation_phase(
+        self,
+        state: dict,
+        user_input: str,
+        decision: ImageDecision,
+    ) -> dict:
+        """处理“等待用户确认提示词”阶段。"""
+        if self._is_expand_request(user_input):
+            prompt = state.get("image_prompt") or decision.prompt or user_input
+            return self._handle_expand(
+                decision.model_copy(update={"prompt": prompt}),
+                user_input,
+                state,
+            )
+
+        replacement_prompt = self._extract_replacement_prompt(user_input)
+        if replacement_prompt:
+            return self._ask_prompt_confirm(
+                prompt=replacement_prompt,
+                response=(
+                    f"我会改用新的描述：\n{replacement_prompt}\n\n"
+                    f"这个描述可以吗？如果可以，请回复“可以”，我再开始生图~"
+                ),
+                state=state,
+                decision=decision,
+            )
+
+        if self._is_confirm(user_input):
+            image_task_type = state.get("image_task_type", "generate_image")
+            if image_task_type == "generate_image":
+                prompt = state.get("image_prompt") or decision.prompt or user_input
+                return self._make_generate_result(prompt, state, decision)
+
+            return _make_result(
+                action="finish",
+                response="好的，这次提示词处理完成啦~",
+                prompt=state.get("image_prompt"),
+                provider="doubao",
+                state_update={"image_phase": "finished"},
+            )
+
+        return self._result_from_decision(state, user_input, decision)
+
+    def _handle_image_confirmation_phase(
+        self,
+        state: dict,
+        user_input: str,
+        decision: ImageDecision,
+    ) -> dict:
+        """处理“等待用户确认图片”阶段。"""
+        if self._is_confirm(user_input):
+            return _make_result(
+                action="finish",
+                response="太好啦，那这次生图任务就完成啦~",
+                prompt=state.get("image_prompt"),
+                provider="doubao",
+                state_update={"image_phase": "finished"},
+            )
+
+        if self._is_negative_confirm(user_input):
+            return _make_result(
+                action="ask_prompt",
+                response="没关系~ 可以告诉我哪里需要调整吗？也可以说“换一张”或重新输入提示词。",
+                prompt=state.get("image_prompt"),
+                provider="doubao",
+                state_update={"image_phase": "awaiting_image_confirm"},
+            )
+
+        if self._is_regenerate_request(user_input):
+            prompt = state.get("last_prompt") or state.get("image_prompt") or decision.prompt or user_input
+            return self._make_generate_result(prompt, state, decision)
+
+        if self._is_expand_request(user_input):
+            prompt = state.get("image_prompt") or state.get("last_prompt") or decision.prompt or user_input
+            return self._handle_expand(
+                decision.model_copy(update={"prompt": prompt}),
+                user_input,
+                state,
+            )
+
+        replacement_prompt = self._extract_replacement_prompt(user_input)
+        if replacement_prompt:
+            return self._make_generate_result(replacement_prompt, state, decision)
+
+        if decision.action == "generate" and decision.prompt:
+            return self._make_generate_result(decision.prompt, state, decision)
+
+        if decision.action == "ask_prompt":
+            return _make_result(
+                action="ask_prompt",
+                response=decision.response,
+                prompt=state.get("image_prompt"),
+                provider="doubao",
+                state_update={"image_phase": "collecting_prompt"},
+            )
+
+        return _make_result(
+            action="ask_prompt",
+            response="需要调整哪里呢？可以说“换一张”、发新的提示词，或者回复“可以”结束这次任务~",
+            prompt=state.get("image_prompt"),
+            provider="doubao",
+            state_update={"image_phase": "awaiting_image_confirm"},
         )
 
     # ============== LLM决策 ==============
@@ -147,6 +406,9 @@ class ImageSubAgent(BaseSubAgent):
         messages = state.get("messages", [])
         history_text = self._format_history(messages[-6:])  # 最近6条
         current_prompt = state.get("image_prompt", "")
+        image_phase = state.get("image_phase", "collecting_prompt")
+        confirmed_prompt = state.get("confirmed_prompt", "")
+        last_prompt = state.get("last_prompt", "")
         image_task_type = state.get("image_task_type", "generate_image")
         available_tools = ", ".join(self.providers.keys()) or "doubao"
 
@@ -154,7 +416,9 @@ class ImageSubAgent(BaseSubAgent):
 
 当前状态：
 - 用户最新输入：{user_input}
+- 当前生图阶段：{image_phase}
 - 当前已确认的提示词：{current_prompt or "（暂无）"}
+- 最近一次确认用于生图的提示词：{confirmed_prompt or last_prompt or "（暂无）"}
 - 图片子任务类型：{image_task_type}（generate_image=生成图片, expand_prompt=扩写提示词, convert_tags=转成Danbooru标签）
 - 可用生图工具：{available_tools}
 
@@ -212,8 +476,14 @@ class ImageSubAgent(BaseSubAgent):
 
     # ============== Action处理 ==============
 
-    def _handle_expand(self, decision: ImageDecision, user_input: str) -> dict:
+    def _handle_expand(
+        self,
+        decision: ImageDecision,
+        user_input: str,
+        state: dict | None = None,
+    ) -> dict:
         """处理扩写：调用expand_prompt，返回确认状态"""
+        state = state or {}
         prompt_to_expand = decision.prompt or user_input
         expanded = expand_prompt(prompt_to_expand, self.llm)
         expanded = self._ensure_anime_style(expanded)
@@ -225,26 +495,120 @@ class ImageSubAgent(BaseSubAgent):
                 f"{expanded}\n\n"
                 f"这个描述可以吗？需要修改哪里吗？"
             ),
-            prompt=prompt_to_expand,
+            prompt=expanded,
             expanded_prompt=expanded,
+            state_update={
+                "image_phase": "awaiting_prompt_confirm",
+                "image_prompt": expanded,
+                "confirmed_prompt": expanded,
+                "size": decision.size or state.get("size", "2K"),
+                "output_format": decision.output_format or state.get("output_format", "jpeg"),
+                "is_batch": decision.is_batch if decision.is_batch is not None else state.get("is_batch", False),
+            },
         )
 
-    def _handle_generate(self, decision: ImageDecision) -> dict:
-        """处理生图决策
+    def _make_generate_result(
+        self,
+        prompt: str,
+        state: dict,
+        decision: ImageDecision,
+    ) -> dict:
+        """构造生图动作结果，并标记为等待生图完成。"""
+        prompt = self._ensure_anime_style(prompt)
+        size = decision.size or state.get("size", "2K")
+        output_format = decision.output_format or state.get("output_format", "jpeg")
+        is_batch = decision.is_batch if decision.is_batch is not None else state.get("is_batch", False)
 
-        不实际调用provider（异步操作由主Agent执行），
-        只返回generate状态和相关参数。
-        """
-        prompt = self._ensure_anime_style(decision.prompt or "")
         return _make_result(
             action="generate",
             response=decision.response or "图片正在生成中，请稍等~",
             prompt=prompt,
             provider="doubao",
-            size=decision.size or "2K",
-            output_format=decision.output_format or "jpeg",
-            is_batch=decision.is_batch or False,
+            size=size,
+            output_format=output_format,
+            is_batch=is_batch,
+            state_update={
+                "image_phase": "awaiting_generation",
+                "image_prompt": prompt,
+                "confirmed_prompt": prompt,
+                "last_prompt": prompt,
+                "size": size,
+                "output_format": output_format,
+                "is_batch": is_batch,
+            },
         )
+
+    def _ask_prompt_confirm(
+        self,
+        prompt: str,
+        response: str,
+        state: dict,
+        decision: ImageDecision,
+    ) -> dict:
+        """要求用户确认提示词，确认后才允许生图。"""
+        size = decision.size or state.get("size", "2K")
+        output_format = decision.output_format or state.get("output_format", "jpeg")
+        is_batch = decision.is_batch if decision.is_batch is not None else state.get("is_batch", False)
+        return _make_result(
+            action="ask_confirm",
+            response=response,
+            prompt=prompt,
+            provider="doubao",
+            state_update={
+                "image_phase": "awaiting_prompt_confirm",
+                "image_prompt": prompt,
+                "confirmed_prompt": prompt,
+                "size": size,
+                "output_format": output_format,
+                "is_batch": is_batch,
+            },
+        )
+
+    @staticmethod
+    def _is_confirm(user_input: str) -> bool:
+        """判断用户是否在确认当前阶段。"""
+        text = user_input.strip().lower()
+        if ImageSubAgent._is_negative_confirm(user_input):
+            return False
+        return any(keyword in text for keyword in _CONFIRM_KEYWORDS)
+
+    @staticmethod
+    def _is_negative_confirm(user_input: str) -> bool:
+        """判断用户是否明确否定当前结果。"""
+        text = user_input.strip().lower()
+        return any(keyword in text for keyword in _NEGATIVE_CONFIRM_KEYWORDS)
+
+    @staticmethod
+    def _is_end_request(user_input: str) -> bool:
+        """判断用户是否明确要求结束任务。"""
+        text = user_input.strip().lower()
+        return any(keyword in text for keyword in _END_KEYWORDS)
+
+    @staticmethod
+    def _is_regenerate_request(user_input: str) -> bool:
+        """判断用户是否要求重新生成图片。"""
+        text = user_input.strip().lower()
+        return any(keyword in text for keyword in _REGENERATE_KEYWORDS)
+
+    @staticmethod
+    def _is_expand_request(user_input: str) -> bool:
+        """判断用户是否要求扩写提示词。"""
+        text = user_input.strip().lower()
+        return any(keyword in text for keyword in _EXPAND_KEYWORDS)
+
+    @staticmethod
+    def _extract_replacement_prompt(user_input: str) -> str:
+        """从“重新输入提示词：...”这类表达中提取新提示词。"""
+        if not any(keyword in user_input for keyword in _REPLACE_PROMPT_KEYWORDS):
+            return ""
+
+        for separator in ("：", ":"):
+            if separator in user_input:
+                candidate = user_input.split(separator, 1)[1].strip()
+                if candidate:
+                    return candidate
+
+        return ""
 
     # ============== 生图执行 ==============
 

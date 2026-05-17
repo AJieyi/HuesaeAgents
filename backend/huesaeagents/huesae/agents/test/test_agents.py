@@ -61,6 +61,14 @@ class FakeStructuredLLM:
 
     @staticmethod
     def _decide_main_action(user_input: str) -> Action:
+        if user_input == "画一只猫":
+            return Action(
+                thought="LLM 选择了低层生图工具，主Agent应转入生图子Agent确认闭环。",
+                type="tool_call",
+                tool_name="generate_image_tool",
+                tool_args={"prompt": user_input, "size": "2K", "output_format": "jpeg"},
+            )
+
         if user_input == "我想生成图片":
             return Action(
                 thought="用户想生图但没有给出描述，委派生图子Agent追问。",
@@ -190,7 +198,7 @@ class TestImageSubAgent:
         assert "请告诉我" in result["response"]
 
     def test_generate_when_has_prompt(self, image_agent):
-        """用户提供明确提示词时，子Agent应进入生成流程。"""
+        """用户提供明确提示词时，子Agent应先请求确认。"""
         state = {
             "messages": [
                 HumanMessage(content="我想生成图片"),
@@ -199,9 +207,9 @@ class TestImageSubAgent:
         }
         result = image_agent.process(state, "夕阳下看大海的少女，穿着水手服")
 
-        assert result["action"] == "generate"
-        assert result["prompt"].startswith("图片风格为 二次元")
-        assert result["data"]["size"] == "2K"
+        assert result["action"] == "ask_confirm"
+        assert "如果这个描述可以" in result["response"]
+        assert result["data"]["state_update"]["image_phase"] == "awaiting_prompt_confirm"
 
     def test_recommend_when_asked(self, image_agent):
         """用户要求推荐时，子Agent应返回推荐内容。"""
@@ -228,6 +236,96 @@ class TestImageSubAgent:
 
         assert result["action"] == "finish"
         assert "喜欢就好" in result["response"]
+
+    def test_confirm_prompt_then_generate(self, image_agent):
+        """生图任务中，用户确认提示词后必须进入生图，不能直接结束。"""
+        state = {
+            "image_task_type": "generate_image",
+            "image_phase": "awaiting_prompt_confirm",
+            "image_prompt": "夕阳下看大海的少女",
+            "confirmed_prompt": "夕阳下看大海的少女",
+        }
+        result = image_agent.process(state, "可以")
+
+        assert result["action"] == "generate"
+        assert result["prompt"].startswith("图片风格为 二次元")
+        assert result["data"]["state_update"]["image_phase"] == "awaiting_generation"
+
+    def test_confirm_image_then_finish(self, image_agent):
+        """图片生成后，用户确认图片满意时任务才结束。"""
+        state = {
+            "image_task_type": "generate_image",
+            "image_phase": "awaiting_image_confirm",
+            "image_prompt": "夕阳下看大海的少女",
+            "last_prompt": "夕阳下看大海的少女",
+            "last_image_urls": ["https://example.com/a.jpeg"],
+        }
+        result = image_agent.process(state, "可以")
+
+        assert result["action"] == "finish"
+        assert result["data"]["state_update"]["image_phase"] == "finished"
+
+    def test_negative_confirm_does_not_finish_image_task(self, image_agent):
+        """用户说不可以时，不能被误判为确认完成。"""
+        state = {
+            "image_task_type": "generate_image",
+            "image_phase": "awaiting_image_confirm",
+            "image_prompt": "夕阳下看大海的少女",
+            "last_prompt": "夕阳下看大海的少女",
+            "last_image_urls": ["https://example.com/a.jpeg"],
+        }
+        result = image_agent.process(state, "不可以")
+
+        assert result["action"] != "finish"
+        assert result["data"]["state_update"]["image_phase"] == "awaiting_image_confirm"
+
+    def test_expand_after_image_does_not_finish_before_generation(self, image_agent):
+        """图片确认阶段扩写后，再确认应继续生图，而不是结束任务。"""
+        state = {
+            "image_task_type": "generate_image",
+            "image_phase": "awaiting_image_confirm",
+            "image_prompt": "夏天的图",
+            "last_prompt": "夏天的图",
+            "last_image_urls": ["https://example.com/a.jpeg"],
+        }
+        expanded = image_agent.process(state, "扩写一下我的提示词")
+
+        assert expanded["action"] == "ask_confirm"
+        assert expanded["data"]["state_update"]["image_phase"] == "awaiting_prompt_confirm"
+
+        state.update(expanded["data"]["state_update"])
+        generated = image_agent.process(state, "可以")
+
+        assert generated["action"] == "generate"
+        assert generated["data"]["state_update"]["image_phase"] == "awaiting_generation"
+
+    def test_regenerate_after_image_keeps_task_active(self, image_agent):
+        """图片确认阶段要求换一张时，应继续用上次提示词生图。"""
+        state = {
+            "image_task_type": "generate_image",
+            "image_phase": "awaiting_image_confirm",
+            "image_prompt": "星空下的少女",
+            "last_prompt": "星空下的少女",
+            "last_image_urls": ["https://example.com/a.jpeg"],
+        }
+        result = image_agent.process(state, "换一张")
+
+        assert result["action"] == "generate"
+        assert "星空下的少女" in result["prompt"]
+
+    def test_replace_prompt_after_image_generates_new_prompt(self, image_agent):
+        """图片确认阶段重新输入提示词时，应使用新提示词继续生图。"""
+        state = {
+            "image_task_type": "generate_image",
+            "image_phase": "awaiting_image_confirm",
+            "image_prompt": "星空下的少女",
+            "last_prompt": "星空下的少女",
+            "last_image_urls": ["https://example.com/a.jpeg"],
+        }
+        result = image_agent.process(state, "我重新输入一组提示词：雨夜霓虹街道")
+
+        assert result["action"] == "generate"
+        assert "雨夜霓虹街道" in result["prompt"]
 
     def test_decide_structured_output(self, image_agent):
         """LLM 决策结果应符合 ImageDecision 结构。"""
@@ -262,6 +360,15 @@ class TestMainAgentIntegration:
         assert len(result["messages"]) == 1
         assert "请告诉我" in result["messages"][0].content
         assert result["active_subagent"]["agent_type"] == "image"
+
+    def test_low_level_image_tool_is_routed_to_subagent(self, main_agent):
+        """主Agent即使选到低层生图工具，也应转入子Agent确认流程。"""
+        result = main_agent.process({"messages": []}, "画一只猫")
+
+        assert result.get("pending_generation") is None
+        assert result["active_subagent"]["agent_type"] == "image"
+        assert result["active_subagent"]["state"]["image_phase"] == "awaiting_prompt_confirm"
+        assert "如果这个描述可以" in result["messages"][0].content
 
     def test_chat_after_image_generation(self, main_agent):
         """没有 active_subagent 时，普通反馈不应再次进入生图流程。"""

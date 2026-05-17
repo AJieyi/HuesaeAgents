@@ -119,16 +119,23 @@ def run_chat_loop():
 
                 # 构造完整回复（包装语 + 图片URL）
                 wrap_msg = image_result["wrap_message"]
+                confirm_msg = image_result.get("confirm_message", "")
                 if image_result.get("image_urls"):
                     images_text = "\n".join(
                         [f"[图片] {url}" for url in image_result["image_urls"]]
                     )
-                    full_msg = f"{wrap_msg}\n\n{images_text}"
+                    full_msg = f"{wrap_msg}\n\n{images_text}\n\n{confirm_msg}"
                 else:
-                    full_msg = f"{wrap_msg}\n\n[图片] {image_result['image_url']}"
+                    full_msg = f"{wrap_msg}\n\n[图片] {image_result['image_url']}\n\n{confirm_msg}"
 
                 # 替换 result 中的消息为完整回复
                 result["messages"] = [AIMessage(content=full_msg)]
+                if result.get("active_subagent"):
+                    active_state = result["active_subagent"].setdefault("state", {})
+                    active_state.update(image_result.get("subagent_state_update", {}))
+                    history = result["active_subagent"].setdefault("history", [])
+                    if history and isinstance(history[-1], AIMessage):
+                        history[-1] = AIMessage(content=full_msg)
 
                 # 流式打印包装语
                 print_stream(wrap_msg)
@@ -140,6 +147,9 @@ def run_chat_loop():
                         print(f"[图片] {url}\n")
                 else:
                     print(f"[图片] {image_result['image_url']}\n")
+                if confirm_msg:
+                    print_stream(confirm_msg)
+                    print()
 
             except Exception as e:
                 error_msg = f"图片生成失败：{str(e)}"
