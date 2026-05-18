@@ -21,7 +21,8 @@ __pycache__/
 venv/
 
 # Environment variables
-.env
+.env*
+*.env
 
 # Configuration files
 config.yaml
@@ -51,6 +52,9 @@ sandbox_image_cache.tar
 
 # ignore the legacy `web` folder
 web/
+
+# Markdown documents
+*.md
 
 # Deployment artifacts
 backend/Dockerfile.langgraph
