@@ -1,0 +1,46 @@
+{
+  "mcpServers": {
+    "video-capture-script-mcp": {
+      "enabled": false,
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@pickstar-2002/video-mcp@latest"],
+      "env": {
+        "TENCENT_SECRET_ID": "$TENCENT_SECRET_ID",
+        "TENCENT_SECRET_KEY": "$TENCENT_SECRET_KEY",
+        "TENCENT_REGION": "${TENCENT_REGION}",
+        "FFMPEG_PATH": "${FFMPEG_PATH}",
+        "FFPROBE_PATH": "${FFPROBE_PATH}"
+      },
+      "description": "热门视频拍摄脚本 MCP，支持视频抽帧、视频内容分析、图片批量分析、视频信息读取、视频脚本生成。"
+    },
+    "douyin-mcp-server": {
+      "enabled": true,
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["douyin-mcp-server"],
+      "env": {
+        "API_KEY": "${DOUYIN_MCP_API_KEY}"
+      },
+      "description": "抖音 MCP，支持解析抖音分享链接、获取无水印下载链接、提取视频语音文案。"
+    },
+    "bilibili-video-download-mcp": {
+      "enabled": false,
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["bilibili-video-download-mcp"],
+      "env": {
+        "FFMPEG_PATH": "${FFMPEG_PATH}",
+        "FFPROBE_PATH": "${FFPROBE_PATH}"
+      },
+      "description": "B站视频下载 MCP，支持获取B站视频信息和下载B站视频。"
+    },
+    "bilibili-mcp": {
+      "enabled": true,
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "mcp-server-bilibili"],
+      "description": "B站解析 MCP，支持解析B站视频链接、获取视频详细信息、下载链接、基础信息和合集视频列表。"
+    }
+  }
+}

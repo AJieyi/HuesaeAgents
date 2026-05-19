@@ -97,7 +97,6 @@ def run_chat_loop():
 
         # 调用主Agent（ReAct 循环）
         result = main_agent.process(state, user_input)
-
         # 处理 pending_generation（子Agent或工具触发的异步生图）
         if result.get("pending_generation"):
             prompt = result.get("prompt", "")

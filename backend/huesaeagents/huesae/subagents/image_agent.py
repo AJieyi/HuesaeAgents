@@ -38,7 +38,34 @@ class ImageDecision(BaseModel):
     provider: str | None = Field(default=None, description="选择的生图工具（当前固定doubao）")
     size: str | None = Field(default="2K", description="图片尺寸，支持 1K, 2K, 3K, 4K 等")
     output_format: str | None = Field(default="jpeg", description="输出图片格式，支持 jpeg, png")
-    is_batch: bool | None = Field(default=False, description="是否使用组图模式，用户明确说明生成数量（如生成4张）时为true")
+    is_batch: bool | None = Field(default=False, description="是否使用组图模式，用户明确表达需要多张图片时为true")
+
+
+class ImageUserIntent(BaseModel):
+    """用户在生图确认流程中的语义意图。"""
+
+    thought: str = Field(description="结合当前阶段分析用户真实意图，不能用关键词机械匹配")
+    intent: Literal[
+        "confirm",              # 确认当前提示词或图片
+        "reject",               # 否定当前提示词或图片，但尚未给出明确新需求
+        "end",                  # 明确结束当前生图任务
+        "regenerate",           # 保持当前提示词重新生成
+        "expand_prompt",        # 扩写当前提示词
+        "replace_prompt",       # 用用户给出的新提示词替换当前提示词
+        "provide_prompt",       # 用户提供了可用于生图的描述
+        "request_recommendation",  # 用户希望系统推荐主题或描述
+        "clarify",              # 用户意图不明确，需要澄清
+        "other",                # 与当前确认流程关系不明确
+    ] = Field(description="用户语义意图")
+    replacement_prompt: str | None = Field(
+        default=None,
+        description="当 intent=replace_prompt 或 provide_prompt 时，提取出的干净图片描述",
+    )
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0, description="意图判断置信度")
+    clarification_question: str | None = Field(
+        default=None,
+        description="当 intent=clarify 或置信度较低时，给用户的澄清问题",
+    )
 
 
 # ============== 标准化返回格式 ==============
@@ -66,34 +93,16 @@ class ImageWorkflowState(TypedDict, total=False):
     state: dict
     user_input: str
     decision: ImageDecision
+    user_intent: ImageUserIntent
     result: dict
 
 
 ImageWorkflowRoute = Literal[
     "finish_task",
+    "clarify_user",
     "prompt_confirmation",
     "image_confirmation",
     "general_decision",
-]
-
-
-_CONFIRM_KEYWORDS = [
-    "可以", "没问题", "就这个", "确认", "行", "好的", "好呀", "生成吧", "开始生成",
-]
-_NEGATIVE_CONFIRM_KEYWORDS = [
-    "不可以", "不行", "不要", "不满意", "不对", "不太行",
-]
-_END_KEYWORDS = [
-    "不用了", "结束吧", "不画了", "先这样", "谢谢不用", "取消",
-]
-_REGENERATE_KEYWORDS = [
-    "换一张", "换一组", "重新生成", "再来一张", "再来一组", "重画",
-]
-_EXPAND_KEYWORDS = [
-    "扩写", "扩展", "写详细", "丰富一下",
-]
-_REPLACE_PROMPT_KEYWORDS = [
-    "重新输入", "新提示词", "换个提示词", "换一个主题", "修改描述",
 ]
 
 
@@ -157,22 +166,27 @@ class ImageSubAgent(BaseSubAgent):
         """
         workflow = StateGraph(ImageWorkflowState)
         workflow.add_node("llm_decide", self._workflow_decide)
+        workflow.add_node("classify_user_intent", self._workflow_classify_user_intent)
         workflow.add_node("finish_task", self._workflow_finish_task)
+        workflow.add_node("clarify_user", self._workflow_clarify_user)
         workflow.add_node("prompt_confirmation", self._workflow_prompt_confirmation)
         workflow.add_node("image_confirmation", self._workflow_image_confirmation)
         workflow.add_node("general_decision", self._workflow_general_decision)
         workflow.add_edge(START, "llm_decide")
+        workflow.add_edge("llm_decide", "classify_user_intent")
         workflow.add_conditional_edges(
-            "llm_decide",
-            self._route_after_decision,
+            "classify_user_intent",
+            self._route_after_intent,
             {
                 "finish_task": "finish_task",
+                "clarify_user": "clarify_user",
                 "prompt_confirmation": "prompt_confirmation",
                 "image_confirmation": "image_confirmation",
                 "general_decision": "general_decision",
             },
         )
         workflow.add_edge("finish_task", END)
+        workflow.add_edge("clarify_user", END)
         workflow.add_edge("prompt_confirmation", END)
         workflow.add_edge("image_confirmation", END)
         workflow.add_edge("general_decision", END)
@@ -184,13 +198,20 @@ class ImageSubAgent(BaseSubAgent):
         user_input = graph_state.get("user_input", "")
         return {"decision": self._decide(state, user_input)}
 
-    def _route_after_decision(self, graph_state: ImageWorkflowState) -> ImageWorkflowRoute:
-        """按当前阶段路由到对应处理节点。"""
+    def _workflow_classify_user_intent(self, graph_state: ImageWorkflowState) -> dict:
+        """使用 LLM 识别用户在确认流程中的语义意图。"""
         state = graph_state.get("state", {})
         user_input = graph_state.get("user_input", "")
+        decision = graph_state["decision"]
+        return {"user_intent": self._classify_user_intent(state, user_input, decision)}
+
+    def _route_after_intent(self, graph_state: ImageWorkflowState) -> ImageWorkflowRoute:
+        """根据 LLM 识别出的语义意图和当前阶段路由。"""
+        state = graph_state.get("state", {})
+        user_intent = graph_state["user_intent"]
         phase = state.get("image_phase", "collecting_prompt")
 
-        if self._is_end_request(user_input):
+        if user_intent.intent == "end":
             return "finish_task"
 
         if phase == "awaiting_image_confirm":
@@ -209,19 +230,44 @@ class ImageSubAgent(BaseSubAgent):
             state_update={"image_phase": "finished"},
         )}
 
+    def _workflow_clarify_user(self, graph_state: ImageWorkflowState) -> dict:
+        """向用户澄清当前确认流程的下一步。"""
+        state = graph_state.get("state", {})
+        user_intent = graph_state["user_intent"]
+        question = user_intent.clarification_question or self._default_clarification_question(state)
+        return {"result": _make_result(
+            action="ask_confirm",
+            response=question,
+            prompt=state.get("image_prompt") or state.get("last_prompt"),
+            provider="doubao",
+            state_update={"image_phase": state.get("image_phase", "collecting_prompt")},
+        )}
+
     def _workflow_prompt_confirmation(self, graph_state: ImageWorkflowState) -> dict:
         """处理提示词确认阶段。"""
         state = graph_state.get("state", {})
         user_input = graph_state.get("user_input", "")
         decision = graph_state["decision"]
-        return {"result": self._handle_prompt_confirmation_phase(state, user_input, decision)}
+        user_intent = graph_state["user_intent"]
+        return {"result": self._handle_prompt_confirmation_phase(
+            state,
+            user_input,
+            decision,
+            user_intent,
+        )}
 
     def _workflow_image_confirmation(self, graph_state: ImageWorkflowState) -> dict:
         """处理图片确认阶段。"""
         state = graph_state.get("state", {})
         user_input = graph_state.get("user_input", "")
         decision = graph_state["decision"]
-        return {"result": self._handle_image_confirmation_phase(state, user_input, decision)}
+        user_intent = graph_state["user_intent"]
+        return {"result": self._handle_image_confirmation_phase(
+            state,
+            user_input,
+            decision,
+            user_intent,
+        )}
 
     def _workflow_general_decision(self, graph_state: ImageWorkflowState) -> dict:
         """处理尚未进入确认阶段的普通生图决策。"""
@@ -296,9 +342,10 @@ class ImageSubAgent(BaseSubAgent):
         state: dict,
         user_input: str,
         decision: ImageDecision,
+        user_intent: ImageUserIntent,
     ) -> dict:
         """处理“等待用户确认提示词”阶段。"""
-        if self._is_expand_request(user_input):
+        if user_intent.intent == "expand_prompt" or decision.action == "expand":
             prompt = state.get("image_prompt") or decision.prompt or user_input
             return self._handle_expand(
                 decision.model_copy(update={"prompt": prompt}),
@@ -306,7 +353,7 @@ class ImageSubAgent(BaseSubAgent):
                 state,
             )
 
-        replacement_prompt = self._extract_replacement_prompt(user_input)
+        replacement_prompt = user_intent.replacement_prompt
         if replacement_prompt:
             return self._ask_prompt_confirm(
                 prompt=replacement_prompt,
@@ -318,7 +365,7 @@ class ImageSubAgent(BaseSubAgent):
                 decision=decision,
             )
 
-        if self._is_confirm(user_input):
+        if user_intent.intent == "confirm" or decision.action == "generate":
             image_task_type = state.get("image_task_type", "generate_image")
             if image_task_type == "generate_image":
                 prompt = state.get("image_prompt") or decision.prompt or user_input
@@ -332,38 +379,38 @@ class ImageSubAgent(BaseSubAgent):
                 state_update={"image_phase": "finished"},
             )
 
-        return self._result_from_decision(state, user_input, decision)
+        if user_intent.intent == "reject":
+            return self._make_clarification_result(
+                state,
+                "需要修改哪一部分呢？您可以直接告诉我新的描述，或者说需要扩写、重新推荐~",
+            )
+
+        return self._make_clarification_result(state, self._default_clarification_question(state))
 
     def _handle_image_confirmation_phase(
         self,
         state: dict,
         user_input: str,
         decision: ImageDecision,
+        user_intent: ImageUserIntent,
     ) -> dict:
         """处理“等待用户确认图片”阶段。"""
-        if self._is_confirm(user_input):
+        if user_intent.intent == "confirm" or decision.action == "finish":
             return _make_result(
                 action="finish",
-                response="太好啦，那这次生图任务就完成啦~",
+                response=decision.response or "太好啦，那这次生图任务就完成啦~",
                 prompt=state.get("image_prompt"),
                 provider="doubao",
                 state_update={"image_phase": "finished"},
             )
 
-        if self._is_negative_confirm(user_input):
-            return _make_result(
-                action="ask_prompt",
-                response="没关系~ 可以告诉我哪里需要调整吗？也可以说“换一张”或重新输入提示词。",
-                prompt=state.get("image_prompt"),
-                provider="doubao",
-                state_update={"image_phase": "awaiting_image_confirm"},
+        if user_intent.intent == "reject":
+            return self._make_clarification_result(
+                state,
+                "没关系~ 可以告诉我哪里需要调整吗？您可以要求重新生成、扩写当前提示词，或直接给我新的提示词。",
             )
 
-        if self._is_regenerate_request(user_input):
-            prompt = state.get("last_prompt") or state.get("image_prompt") or decision.prompt or user_input
-            return self._make_generate_result(prompt, state, decision)
-
-        if self._is_expand_request(user_input):
+        if user_intent.intent == "expand_prompt" or decision.action == "expand":
             prompt = state.get("image_prompt") or state.get("last_prompt") or decision.prompt or user_input
             return self._handle_expand(
                 decision.model_copy(update={"prompt": prompt}),
@@ -371,29 +418,21 @@ class ImageSubAgent(BaseSubAgent):
                 state,
             )
 
-        replacement_prompt = self._extract_replacement_prompt(user_input)
+        replacement_prompt = user_intent.replacement_prompt
         if replacement_prompt:
-            return self._make_generate_result(replacement_prompt, state, decision)
+            return self._ask_new_prompt_confirm(replacement_prompt, state, decision)
+
+        if user_intent.intent in ("replace_prompt", "provide_prompt") and decision.prompt:
+            return self._ask_new_prompt_confirm(decision.prompt, state, decision)
+
+        if user_intent.intent == "regenerate":
+            prompt = state.get("last_prompt") or state.get("image_prompt") or decision.prompt or user_input
+            return self._make_generate_result(prompt, state, decision)
 
         if decision.action == "generate" and decision.prompt:
-            return self._make_generate_result(decision.prompt, state, decision)
+            return self._ask_new_prompt_confirm(decision.prompt, state, decision)
 
-        if decision.action == "ask_prompt":
-            return _make_result(
-                action="ask_prompt",
-                response=decision.response,
-                prompt=state.get("image_prompt"),
-                provider="doubao",
-                state_update={"image_phase": "collecting_prompt"},
-            )
-
-        return _make_result(
-            action="ask_prompt",
-            response="需要调整哪里呢？可以说“换一张”、发新的提示词，或者回复“可以”结束这次任务~",
-            prompt=state.get("image_prompt"),
-            provider="doubao",
-            state_update={"image_phase": "awaiting_image_confirm"},
-        )
+        return self._make_clarification_result(state, self._default_clarification_question(state))
 
     # ============== LLM决策 ==============
 
@@ -457,23 +496,6 @@ class ImageSubAgent(BaseSubAgent):
                 lines.append(f"{role}：{msg.content}")
         return "\n".join(lines) if lines else "（无历史对话）"
 
-    # ============== 风格处理 ==============
-
-    @staticmethod
-    def _ensure_anime_style(prompt: str) -> str:
-        """确保提示词包含动漫风格前缀
-
-        默认添加"二次元动漫风格"前缀，除非用户明确要求真人/写实风格。
-        """
-        if not prompt:
-            return prompt
-        lower = prompt.lower()
-        # 用户明确要求非动漫风格
-        if any(kw in lower for kw in ["真人", "写实", "照片", "photorealistic", "realistic", "real person"]):
-            return prompt
-        # 已经包含动漫关键词
-        return f"图片风格为 二次元，{prompt}"
-
     # ============== Action处理 ==============
 
     def _handle_expand(
@@ -486,7 +508,6 @@ class ImageSubAgent(BaseSubAgent):
         state = state or {}
         prompt_to_expand = decision.prompt or user_input
         expanded = expand_prompt(prompt_to_expand, self.llm)
-        expanded = self._ensure_anime_style(expanded)
 
         return _make_result(
             action="ask_confirm",
@@ -514,7 +535,6 @@ class ImageSubAgent(BaseSubAgent):
         decision: ImageDecision,
     ) -> dict:
         """构造生图动作结果，并标记为等待生图完成。"""
-        prompt = self._ensure_anime_style(prompt)
         size = decision.size or state.get("size", "2K")
         output_format = decision.output_format or state.get("output_format", "jpeg")
         is_batch = decision.is_batch if decision.is_batch is not None else state.get("is_batch", False)
@@ -564,51 +584,93 @@ class ImageSubAgent(BaseSubAgent):
             },
         )
 
-    @staticmethod
-    def _is_confirm(user_input: str) -> bool:
-        """判断用户是否在确认当前阶段。"""
-        text = user_input.strip().lower()
-        if ImageSubAgent._is_negative_confirm(user_input):
-            return False
-        return any(keyword in text for keyword in _CONFIRM_KEYWORDS)
+    def _ask_new_prompt_confirm(
+        self,
+        prompt: str,
+        state: dict,
+        decision: ImageDecision,
+    ) -> dict:
+        """图片确认阶段收到新描述时，先进入提示词确认闭环。"""
+        return self._ask_prompt_confirm(
+            prompt=prompt,
+            response=(
+                f"看起来是个很可爱的场景呢！{prompt}\n\n"
+                f"请问这个描述可以吗？或者想要我帮你丰富一下细节呢？"
+            ),
+            state=state,
+            decision=decision,
+        )
+
+    def _classify_user_intent(
+        self,
+        state: dict,
+        user_input: str,
+        decision: ImageDecision,
+    ) -> ImageUserIntent:
+        """用 LLM 语义识别用户意图；不使用关键词规则。"""
+        phase = state.get("image_phase", "collecting_prompt")
+        current_prompt = state.get("image_prompt") or "（暂无）"
+        last_prompt = state.get("last_prompt") or "（暂无）"
+        last_images = state.get("last_image_urls") or []
+
+        intent_prompt = f"""请基于语义判断用户在生图流程中的真实意图，不要做关键词匹配。
+
+当前阶段：{phase}
+当前提示词：{current_prompt}
+最近一次生图提示词：{last_prompt}
+最近生成图片：{last_images or "（暂无）"}
+LLM候选动作：{decision.action}
+LLM候选提示词：{decision.prompt or "（暂无）"}
+用户最新输入：{user_input}
+
+可选意图：
+- confirm：确认当前提示词或图片
+- reject：否定当前结果，但没有给出明确新动作
+- end：明确结束当前生图任务
+- regenerate：保持当前提示词重新生成
+- expand_prompt：扩写当前提示词
+- replace_prompt：用户给出了新提示词，要替换当前提示词
+- provide_prompt：用户提供了可用于生图的描述
+- request_recommendation：用户希望系统推荐主题或描述
+- clarify：用户意图不明确，需要追问澄清
+- other：与当前确认流程关系不明确
+
+如果用户提供了新提示词，请把干净的图片描述放入 replacement_prompt。
+如果无法确定用户想确认、修改、重生、结束还是提供新提示词，请选择 clarify，并给出一个简短中文澄清问题。"""
+
+        try:
+            structured_llm = self.llm.with_structured_output(
+                ImageUserIntent,
+                method="json_mode",
+            )
+            return structured_llm.invoke([HumanMessage(content=intent_prompt)])
+        except Exception:
+            return ImageUserIntent(
+                thought="用户意图识别失败，进入澄清流程",
+                intent="clarify",
+                confidence=0.0,
+                clarification_question=self._default_clarification_question(state),
+            )
+
+    def _make_clarification_result(self, state: dict, question: str) -> dict:
+        """构造澄清结果，保持当前阶段不变。"""
+        return _make_result(
+            action="ask_confirm",
+            response=question,
+            prompt=state.get("image_prompt") or state.get("last_prompt"),
+            provider="doubao",
+            state_update={"image_phase": state.get("image_phase", "collecting_prompt")},
+        )
 
     @staticmethod
-    def _is_negative_confirm(user_input: str) -> bool:
-        """判断用户是否明确否定当前结果。"""
-        text = user_input.strip().lower()
-        return any(keyword in text for keyword in _NEGATIVE_CONFIRM_KEYWORDS)
-
-    @staticmethod
-    def _is_end_request(user_input: str) -> bool:
-        """判断用户是否明确要求结束任务。"""
-        text = user_input.strip().lower()
-        return any(keyword in text for keyword in _END_KEYWORDS)
-
-    @staticmethod
-    def _is_regenerate_request(user_input: str) -> bool:
-        """判断用户是否要求重新生成图片。"""
-        text = user_input.strip().lower()
-        return any(keyword in text for keyword in _REGENERATE_KEYWORDS)
-
-    @staticmethod
-    def _is_expand_request(user_input: str) -> bool:
-        """判断用户是否要求扩写提示词。"""
-        text = user_input.strip().lower()
-        return any(keyword in text for keyword in _EXPAND_KEYWORDS)
-
-    @staticmethod
-    def _extract_replacement_prompt(user_input: str) -> str:
-        """从“重新输入提示词：...”这类表达中提取新提示词。"""
-        if not any(keyword in user_input for keyword in _REPLACE_PROMPT_KEYWORDS):
-            return ""
-
-        for separator in ("：", ":"):
-            if separator in user_input:
-                candidate = user_input.split(separator, 1)[1].strip()
-                if candidate:
-                    return candidate
-
-        return ""
+    def _default_clarification_question(state: dict) -> str:
+        """根据当前阶段生成默认澄清问题。"""
+        phase = state.get("image_phase", "collecting_prompt")
+        if phase == "awaiting_prompt_confirm":
+            return "您是想确认这个描述开始生图，还是想继续修改或扩写提示词呢？"
+        if phase == "awaiting_image_confirm":
+            return "您是满意这张图想结束任务，还是想重新生成、扩写提示词，或换一组新的提示词呢？"
+        return "我还没完全理解您的生图需求，可以再具体描述一下您想生成的画面吗？"
 
     # ============== 生图执行 ==============
 

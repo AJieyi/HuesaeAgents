@@ -11,11 +11,16 @@
 3. 保留子Agent的多轮对话能力（通过 task_tool 委托）
 """
 from langchain_core.language_models import BaseChatModel
-from langchain.messages import HumanMessage, AIMessage, SystemMessage
+from langchain.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 
 from ...subagents.base import BaseSubAgent
 from ...subagents.registry import SubAgentRegistry
-from ...tools.tools import Action, create_tools, parse_subagent_task
+from ...tools.runtime import MAIN_AGENT_EXCLUDED_TOOL_NAMES, build_shared_runtime
+from ...tools.tools import (
+    LOAD_MCP_TOOLS_SIGNAL,
+    is_load_mcp_tools_signal,
+    parse_subagent_task,
+)
 
 
 # ============== 安全检查 ==============
@@ -24,47 +29,6 @@ _SAFE_KEYWORDS = [
     "自杀", "自残", "想死", "不想活", "结束生命", "活着没意思",
     "kill myself", "suicide", "self-harm",
 ]
-
-
-# ============== 主Agent系统提示词 ==============
-
-MAIN_AGENT_SYSTEM_PROMPT = """你是 HuesaeAgents 的主Agent，负责理解用户需求并选择合适的工具或回复方式。
-
-## 你的角色
-{character_tone}
-
-## 可用工具
-{tools_description}
-
-## 可委派子Agent
-{subagents_description}
-
-## 工作原则
-1. 仔细分析用户需求，选择最合适的工具或直接回复
-2. 用户需要生图、画图、出图时，优先调用 task_tool 委托 image 子Agent处理确认闭环
-3. 当用户需求模糊或需要多轮对话时，也调用 task_tool 委托子Agent处理
-4. 调用工具后，基于工具结果给用户友好的回复
-5. 每次只能选择一个行动：直接回复 或 调用一个工具
-
-## 工具选择指南
-- 工具描述是你选择工具的主要依据，优先根据工具名称、参数和描述做决策
-- generate_image_tool: 低层单图工具，通常由生图子Agent确认后触发；主Agent不要直接用它绕过确认
-- generate_images_tool: 低层组图工具，通常由生图子Agent确认后触发；主Agent不要直接用它绕过确认
-- expand_prompt_tool: 用户要求扩写图片描述（"扩写一下"、"写详细点"）
-- convert_tags_tool: 用户要求转成Danbooru标签（"生成标签"、"转成标签"）
-- task_tool: 用户说"我想生成图片"但没给具体描述、需要推荐、需要多轮确认
-- reply: 日常聊天、问候、用户说"不用了"、"谢谢"等
-
-## 输出格式
-请以 JSON 格式输出：
-{{
-  "thought": "分析用户需求...",
-  "type": "reply 或 tool_call",
-  "tool_name": "工具名称（type=tool_call时）",
-  "tool_args": {{参数}},
-  "response": "直接回复内容（type=reply时）"
-}}
-"""
 
 
 # ============== 主Agent ==============
@@ -87,10 +51,15 @@ class HuesaeMainAgent:
         self,
         llm: BaseChatModel,
         character_id: str = "gentle_sister",
+        mcp_tools_loader=None,
     ):
         self.llm = llm
         self.character_id = character_id
         self.subagent_registry = SubAgentRegistry()
+        runtime_kwargs = {}
+        if mcp_tools_loader is not None:
+            runtime_kwargs["mcp_tools_loader"] = mcp_tools_loader
+        self._runtime = build_shared_runtime(self.llm, self.subagent_registry, **runtime_kwargs)
         self.tools = []
         self.tool_map = {}
         self._refresh_tools()
@@ -100,14 +69,42 @@ class HuesaeMainAgent:
 
         子Agent注册变化会影响 task_tool 的可用描述，因此注册后刷新一次。
         """
-        self.tools = create_tools(self.llm, subagent_registry=self.subagent_registry)
-        self.tool_map = {t.name: t for t in self.tools}
+        self._runtime.subagent_registry = self.subagent_registry
+        self._runtime.refresh_builtin_tools()
+        self.tools = self._runtime.get_tools(
+            include_mcp=False,
+            include_task_tool=True,
+            exclude_names=MAIN_AGENT_EXCLUDED_TOOL_NAMES,
+        )
+        self.tool_map = self._runtime.get_tool_map(
+            include_mcp=False,
+            include_task_tool=True,
+            exclude_names=MAIN_AGENT_EXCLUDED_TOOL_NAMES,
+        )
+
+    def _refresh_tools_with_mcp(self) -> None:
+        """懒加载 MCP 工具后刷新完整工具视图。"""
+        self._runtime.subagent_registry = self.subagent_registry
+        self._runtime.refresh_builtin_tools()
+        self.tools = self._runtime.get_tools(
+            include_mcp=True,
+            include_task_tool=True,
+            exclude_names=MAIN_AGENT_EXCLUDED_TOOL_NAMES,
+        )
+        self.tool_map = self._runtime.get_tool_map(
+            include_mcp=True,
+            include_task_tool=True,
+            exclude_names=MAIN_AGENT_EXCLUDED_TOOL_NAMES,
+        )
 
     def register_sub_agent(self, agent: BaseSubAgent) -> None:
         """注册子Agent"""
         description = None
         if agent.name == "image":
             description = "生图对话Agent，处理追问、推荐、扩写、确认、单图和组图生成。"
+        # 通用子Agent后续可通过 runtime 读取共享工具池；
+        # 子Agent视图应使用 include_task_tool=False，避免子Agent继续委派子Agent。
+        agent.runtime = self._runtime
         self.subagent_registry.register(agent, description=description)
         self._refresh_tools()
 
@@ -134,66 +131,52 @@ class HuesaeMainAgent:
         if state.get("active_subagent"):
             return self._handle_subagent(state, user_input)
 
-        # 3. ReAct 循环
-        tool_results = []
+        # 3. LangChain 原生函数调用循环
+        working_messages = self._build_messages(state, user_input)
+        tool_results: list[str] = []
 
         for step in range(self.MAX_STEPS):
-            # 构建系统提示词（含工具描述 + 角色语气）
-            system_msg = self._build_system_prompt()
-
-            # 构建消息列表
-            messages = [system_msg]
-            # 加入历史消息（最近10条）
-            messages.extend(state.get("messages", [])[-10:])
-            # 加入用户输入
-            messages.append(HumanMessage(content=user_input))
-            # 加入之前的工具结果
-            for result in tool_results:
-                messages.append(AIMessage(content=f"工具执行结果：{result}"))
-
-            # 调用 LLM 获取 Action
             try:
-                structured_llm = self.llm.with_structured_output(
-                    Action,
-                    method="json_mode",
-                )
-                action = structured_llm.invoke(messages)
+                ai_message = self._invoke_with_tools(working_messages)
             except Exception:
-                # 降级处理：结构化决策失败时直接聊天。
+                # 降级处理：函数调用失败时直接聊天。
                 chat_response = self._chat_reply(state, user_input)
                 return {"messages": [AIMessage(content=chat_response)]}
 
-            if action.type == "reply":
-                return {"messages": [AIMessage(content=action.response or "")]}
+            tool_calls = getattr(ai_message, "tool_calls", None) or []
+            if not tool_calls:
+                return {"messages": [AIMessage(content=str(ai_message.content or ""))]}
 
-            if action.type == "tool_call":
-                tool_args = action.tool_args or {}
-                # 低层生图工具也转入子Agent，避免绕过用户确认闭环。
-                if action.tool_name in ("generate_image_tool", "generate_images_tool"):
-                    initial_state = {
-                        "size": tool_args.get("size", "2K"),
-                        "output_format": tool_args.get("output_format", "jpeg"),
-                        "is_batch": action.tool_name == "generate_images_tool",
-                    }
-                    return self._start_subagent(
-                        state,
-                        "image",
-                        tool_args.get("prompt", user_input),
-                        initial_state=initial_state,
+            working_messages.append(ai_message)
+            for tool_call in tool_calls:
+                tool_name = tool_call.get("name") or ""
+                tool_args = tool_call.get("args") or {}
+                tool_call_id = tool_call.get("id") or tool_name
+                result = self._execute_tool(tool_name, tool_args)
+
+                if is_load_mcp_tools_signal(result):
+                    if not self._runtime.mcp_loaded:
+                        self._refresh_tools_with_mcp()
+                    result = (
+                        "MCP扩展工具已加载。请结合用户原始需求，根据更新后的工具列表重新选择最合适的具体工具，"
+                        "并严格使用工具 schema 中的参数名。"
                     )
 
-                result = self._execute_tool(action.tool_name, tool_args)
-
-                # 检查是否是子Agent委托
                 task = parse_subagent_task(result) if isinstance(result, str) else None
                 if task is not None:
                     subagent_type, description = task
                     return self._start_subagent(state, subagent_type, description)
 
-                # 快速工具：结果加入上下文，继续循环让LLM生成最终回复
-                tool_results.append(result)
+                result_text = str(result)
+                tool_results.append(result_text)
+                working_messages.append(ToolMessage(content=result_text, tool_call_id=tool_call_id))
 
-        # 超过最大步数后降级到直接聊天。
+            working_messages[0] = self._build_system_prompt()
+
+        if tool_results:
+            return {"messages": [AIMessage(content=self._format_last_tool_result(tool_results[-1]))]}
+
+        # 超过最大步数且没有工具结果时，降级到直接聊天。
         chat_response = self._chat_reply(state, user_input)
         return {"messages": [AIMessage(content=chat_response)]}
 
@@ -201,31 +184,54 @@ class HuesaeMainAgent:
 
     def _build_system_prompt(self) -> SystemMessage:
         """构建含工具描述的系统提示词"""
-        from .prompts import get_character_system_message
+        from .prompts import build_main_system_message
 
-        character_msg = get_character_system_message(self.character_id)
-        character_tone = character_msg.content
-
-        # 构建工具描述
-        tools_desc = []
-        for tool in self.tools:
-            tools_desc.append(f"- {tool.name}: {tool.description}")
-        tools_description = "\n".join(tools_desc)
+        tools_description = self._runtime.format_tools_for_prompt(
+            include_mcp=self._runtime.mcp_loaded,
+            include_task_tool=True,
+            exclude_names=MAIN_AGENT_EXCLUDED_TOOL_NAMES,
+        )
+        tool_constraints = self._runtime.format_tool_constraints(
+            include_mcp=self._runtime.mcp_loaded,
+            include_task_tool=True,
+            exclude_names=MAIN_AGENT_EXCLUDED_TOOL_NAMES,
+        )
+        mcp_tool_principles = self._runtime.format_mcp_tool_principles()
         subagents_description = self.subagent_registry.format_for_prompt()
 
-        content = MAIN_AGENT_SYSTEM_PROMPT.format(
-            character_tone=character_tone,
+        return build_main_system_message(
+            character_id=self.character_id,
             tools_description=tools_description,
+            tool_constraints=tool_constraints,
+            mcp_tool_principles=mcp_tool_principles,
             subagents_description=subagents_description,
         )
-        return SystemMessage(content=content)
+
+    def _build_messages(self, state: dict, user_input: str) -> list:
+        """构建函数调用循环所需消息。"""
+        messages = [self._build_system_prompt()]
+        messages.extend(state.get("messages", [])[-10:])
+        messages.append(HumanMessage(content=user_input))
+        return messages
+
+    def _invoke_with_tools(self, messages: list) -> AIMessage:
+        """使用 LangChain 原生工具绑定调用模型。"""
+        bound_llm = self.llm.bind_tools(self.tools)
+        response = bound_llm.invoke(messages)
+        if isinstance(response, AIMessage):
+            return response
+        return AIMessage(content=str(getattr(response, "content", response)))
 
     # ============== 工具执行 ==============
 
     def _execute_tool(self, tool_name: str, tool_args: dict) -> str:
         """执行指定工具"""
         if tool_name not in self.tool_map:
-            return f"错误：未知工具 {tool_name}。可用工具：{list(self.tool_map.keys())}"
+            if not self._runtime.mcp_loaded:
+                self._refresh_tools_with_mcp()
+                return LOAD_MCP_TOOLS_SIGNAL
+            if tool_name not in self.tool_map:
+                return f"错误：未知工具 {tool_name}。可用工具：{list(self.tool_map.keys())}"
 
         tool = self.tool_map[tool_name]
         try:
@@ -234,6 +240,16 @@ class HuesaeMainAgent:
             return str(result)
         except Exception as e:
             return f"工具执行失败：{str(e)}"
+
+    @staticmethod
+    def _format_last_tool_result(result) -> str:
+        """ReAct 步数耗尽时，优先把已获得的工具结果返回给用户。"""
+        text = str(result).strip()
+        if not text:
+            return "工具已经执行完成，但没有返回可展示的内容。"
+        if text.startswith("工具执行失败") or text.startswith("错误："):
+            return text
+        return text
 
     # ============== 子Agent处理 ==============
 
@@ -457,6 +473,7 @@ class HuesaeMainAgent:
 def create_main_agent(
     llm: BaseChatModel | None = None,
     character_id: str = "gentle_sister",
+    mcp_tools_loader=None,
 ) -> HuesaeMainAgent:
     """创建主Agent工厂函数
 
@@ -474,4 +491,8 @@ def create_main_agent(
             from huesaeagents.huesae.models.models_factory import create_chat_model
         llm = create_chat_model("deepseek")
 
-    return HuesaeMainAgent(llm=llm, character_id=character_id)
+    return HuesaeMainAgent(
+        llm=llm,
+        character_id=character_id,
+        mcp_tools_loader=mcp_tools_loader,
+    )

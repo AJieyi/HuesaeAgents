@@ -3,6 +3,7 @@
 定义所有子Agent的统一接口，主Agent通过此接口调用子Agent。
 """
 from abc import ABC, abstractmethod
+from typing import Any
 
 
 class BaseSubAgent(ABC):
@@ -11,6 +12,8 @@ class BaseSubAgent(ABC):
     所有子Agent必须实现 process 方法，返回标准化结果。
     子Agent本身是无状态的，每次调用接收完整对话历史做决策。
     """
+
+    runtime: Any | None = None
 
     @abstractmethod
     def process(self, state: dict, user_input: str) -> dict:

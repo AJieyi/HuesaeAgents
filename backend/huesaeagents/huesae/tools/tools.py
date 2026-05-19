@@ -24,7 +24,7 @@ class Action(BaseModel):
     )
     tool_name: str | None = Field(
         default=None,
-        description="当 type=tool_call 时，要调用的工具名称（generate_image_tool/generate_images_tool/expand_prompt_tool/convert_tags_tool/task_tool）"
+        description="当 type=tool_call 时，要调用的当前可见工具名称"
     )
     tool_args: dict | None = Field(
         default=None,
@@ -37,6 +37,7 @@ class Action(BaseModel):
 
 
 SUBAGENT_TASK_PREFIX = "__SUBAGENT_TASK__"
+LOAD_MCP_TOOLS_SIGNAL = "__LOAD_MCP_TOOLS__"
 
 
 def encode_subagent_task(subagent_type: str, description: str) -> str:
@@ -52,6 +53,11 @@ def parse_subagent_task(result: str) -> tuple[str, str] | None:
     if len(parts) < 3:
         return None
     return parts[1], parts[2]
+
+
+def is_load_mcp_tools_signal(result: str) -> bool:
+    """判断工具结果是否要求主Agent加载 MCP 工具。"""
+    return result == LOAD_MCP_TOOLS_SIGNAL
 
 
 class ToolRegistry:
@@ -84,11 +90,11 @@ class ToolRegistry:
 
 # ============== 工具创建工厂 ==============
 
-def create_tools(
+def get_builtin_tools(
     llm: BaseChatModel,
     subagent_registry: SubAgentRegistry | None = None,
 ) -> list[BaseTool]:
-    """创建主Agent可用工具列表。"""
+    """创建内置工具列表。"""
 
     # 延迟导入避免循环依赖。
     try:
@@ -166,11 +172,24 @@ def create_tools(
         return response.content
 
     @tool
+    def load_mcp_tools_tool() -> str:
+        """加载 MCP 扩展工具。当用户需要外部 MCP 能力，但当前工具列表还没有具体 MCP 工具时调用。
+
+        使用场景：
+        - 用户需要当前内置工具无法完成的外部扩展能力
+        - 用户提供线上平台链接，希望解析、下载或提取内容
+        - 用户提供本地文件路径，希望读取、分析或生成脚本
+        - 当前工具列表中还没有具体的 MCP 工具名称
+        - 需要先发现线上 MCP server 暴露的工具，再继续选择具体工具
+        """
+        return LOAD_MCP_TOOLS_SIGNAL
+
+    @tool
     def task_tool(description: str, subagent_type: str = "image") -> str:
         """委托子Agent处理复杂任务。当任务需要多步骤、专业处理、多轮对话时使用此工具。
 
         使用场景：
-        - 用户说"我想生成图片"但没有提供具体描述（需要追问）
+        - 用户表达生图需求但没有提供具体描述（需要追问）
         - 用户要求推荐图片主题
         - 需要多轮确认的生图流程
 
@@ -202,6 +221,51 @@ def create_tools(
         generate_images_tool,
         expand_prompt_tool,
         convert_tags_tool,
+        load_mcp_tools_tool,
         task_tool,
     ])
     return registry.tools
+
+
+def get_available_tools(
+    llm: BaseChatModel,
+    subagent_registry: SubAgentRegistry | None = None,
+    *,
+    include_mcp: bool = True,
+    include_task_tool: bool = True,
+    runtime=None,
+) -> list[BaseTool]:
+    """获取调用方可见的工具列表。
+
+    主Agent使用 include_task_tool=True；子Agent使用 include_task_tool=False，
+    从架构上禁止子Agent继续委派其他子Agent。
+    """
+    if runtime is not None:
+        return runtime.get_tools(
+            include_mcp=include_mcp,
+            include_task_tool=include_task_tool,
+        )
+
+    from .runtime import build_shared_runtime
+
+    shared_runtime = build_shared_runtime(llm, subagent_registry)
+    return shared_runtime.get_tools(
+        include_mcp=include_mcp,
+        include_task_tool=include_task_tool,
+    )
+
+
+def create_tools(
+    llm: BaseChatModel,
+    subagent_registry: SubAgentRegistry | None = None,
+) -> list[BaseTool]:
+    """创建主Agent可用工具列表。
+
+    兼容旧入口；新代码优先通过 SharedToolRuntime 获取工具。
+    """
+    return get_available_tools(
+        llm,
+        subagent_registry,
+        include_mcp=False,
+        include_task_tool=True,
+    )

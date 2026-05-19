@@ -11,6 +11,7 @@ class RegisteredSubAgent(Protocol):
     """注册表需要的子Agent最小接口。"""
 
     name: str
+    runtime: object | None
 
 
 @dataclass(frozen=True)
