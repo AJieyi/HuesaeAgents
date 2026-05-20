@@ -58,15 +58,18 @@ def run_chat_loop():
     - 输入 exit/quit 退出
     """
     from .lead_agent import create_main_agent
+    from ...skills.registry import SkillRegistry
     from ...subagents.image_agent import create_image_agent
 
     # 创建主Agent并注册子Agent
-    main_agent = create_main_agent()
+    skill_registry = SkillRegistry()
+    main_agent = create_main_agent(skill_registry=skill_registry)
     main_agent.register_sub_agent(create_image_agent())
 
     # 终端交互只保留当前进程内的临时对话状态。
     messages = []
     active_subagent = None
+    vision_context = None
 
     print("=" * 50)
     print("HuesaeAgents 终端交互")
@@ -93,6 +96,7 @@ def run_chat_loop():
         state = {
             "messages": messages,
             "active_subagent": active_subagent,
+            "vision_context": vision_context,
         }
 
         # 调用主Agent（ReAct 循环）
@@ -169,6 +173,8 @@ def run_chat_loop():
             active_subagent = result["active_subagent"]
         if result.get("clear_subagent"):
             active_subagent = None
+        if "vision_context" in result:
+            vision_context = result["vision_context"]
 
         # 更新主对话历史
         messages.append(HumanMessage(content=user_input))

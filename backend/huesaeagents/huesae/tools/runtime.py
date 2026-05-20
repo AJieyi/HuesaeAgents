@@ -10,6 +10,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
 
 from ..mcp.cache import initialize_mcp_tools
+from ..skills.registry import SkillRegistry
 from ..subagents.registry import SubAgentRegistry
 
 
@@ -25,9 +26,11 @@ class SharedToolRuntime:
         subagent_registry: SubAgentRegistry | None = None,
         *,
         mcp_tools_loader=initialize_mcp_tools,
+        skill_registry: SkillRegistry | None = None,
     ):
         self.llm = llm
         self.subagent_registry = subagent_registry
+        self.skill_registry = skill_registry
         self._mcp_tools_loader = mcp_tools_loader
         self._builtin_tools: list[BaseTool] = []
         self._mcp_tools: list[BaseTool] | None = None
@@ -41,7 +44,11 @@ class SharedToolRuntime:
         """刷新内置工具，通常在子Agent注册变化后调用。"""
         from .tools import get_builtin_tools
 
-        self._builtin_tools = get_builtin_tools(self.llm, self.subagent_registry)
+        self._builtin_tools = get_builtin_tools(
+            self.llm,
+            self.subagent_registry,
+            skill_registry=self.skill_registry,
+        )
 
     def refresh_mcp_tools(self, force: bool = False) -> None:
         """刷新 MCP 工具缓存。"""
@@ -153,6 +160,11 @@ class SharedToolRuntime:
             else:
                 lines.append("- 当用户需要当前可见工具之外的扩展能力时，先调用 load_mcp_tools_tool 完成 MCP 工具发现。")
 
+        if "read_skill_tool" in visible_names:
+            lines.append("- 当用户需求匹配某个 Skill 时，先调用 read_skill_tool 读取完整指令；Skill 不是工具本身。")
+        if "bash_tool" in visible_names:
+            lines.append("- bash_tool 仅用于执行已读取 Skill 中明确需要的命令，调用前确认命令和参数来自当前任务。")
+
         return "\n".join(lines)
 
     def format_mcp_tool_principles(self) -> str:
@@ -210,12 +222,14 @@ def build_shared_runtime(
     subagent_registry: SubAgentRegistry | None = None,
     *,
     mcp_tools_loader=initialize_mcp_tools,
+    skill_registry: SkillRegistry | None = None,
 ) -> SharedToolRuntime:
     """创建共享工具运行时。"""
     runtime = SharedToolRuntime(
         llm=llm,
         subagent_registry=subagent_registry,
         mcp_tools_loader=mcp_tools_loader,
+        skill_registry=skill_registry,
     )
     runtime.refresh_builtin_tools()
     return runtime

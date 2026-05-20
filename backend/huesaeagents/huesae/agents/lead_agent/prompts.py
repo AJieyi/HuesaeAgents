@@ -31,7 +31,7 @@ MAIN_AGENT_SYSTEM_PROMPT = """你是 HuesaeAgents 的主Agent，负责理解用�
 ## 可委派子Agent
 {subagents_description}
 
-## Skills
+## 可用 Skills
 {skills_section}
 
 ## 工作原则
@@ -39,8 +39,15 @@ MAIN_AGENT_SYSTEM_PROMPT = """你是 HuesaeAgents 的主Agent，负责理解用�
 2. 需要工具时使用 LangChain 函数调用，不要把工具调用写成普通文本。
 3. 用户任务需要专业处理、多轮追问或确认闭环时，使用可见工具委派合适的子Agent。
 4. 用户提供本地文件路径并请求处理时，如果当前可见工具不足，先调用扩展工具发现工具；不要直接回复“无法访问本地文件”。
-5. 用户需求模糊且缺少必要信息时，先追问澄清。
-6. 调用工具后，基于工具结果给用户友好的回复。
+5. 用户提供图片路径或图片 URL，并要求反推提示词、识图写提示词、图生文描述时，调用 reverse_image_prompt。
+6. 用户围绕上一张图片要求“换一版提示词”“再反推一次”时，复用图像上下文中的图片路径调用 reverse_image_prompt，不要重新询问路径。
+7. 用户需求匹配某个 Skill 时，先调用 read_skill_tool 读取完整 Skill 指令，再按指令选择已有工具执行。
+8. Skill 是“如何完成任务”的说明，不是普通函数工具；不要只看 Skill 名称就跳过读取步骤。
+9. 用户需求模糊且缺少必要信息时，先追问澄清。
+10. 调用工具后，基于工具结果给用户友好的回复。
+
+## 图像上下文
+{vision_context_section}
 """
 
 
@@ -70,6 +77,7 @@ def build_main_system_message(
     mcp_tool_principles: str,
     subagents_description: str,
     skills_section: str = "暂无可用 Skills。",
+    vision_context_section: str = "暂无图像上下文。",
 ) -> SystemMessage:
     """构建主Agent系统提示词。
 
@@ -84,5 +92,6 @@ def build_main_system_message(
         mcp_tool_principles=mcp_tool_principles,
         subagents_description=subagents_description,
         skills_section=skills_section,
+        vision_context_section=vision_context_section,
     )
     return SystemMessage(content=content)

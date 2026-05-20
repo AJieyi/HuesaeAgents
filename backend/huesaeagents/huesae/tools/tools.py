@@ -3,6 +3,7 @@
 工具选择由 LLM 自主决定，系统只提供工具列表和描述。
 主Agent通过 ReAct 循环让 LLM 自主决策调用哪个工具。
 """
+import subprocess
 from typing import Literal
 
 from langchain.tools import BaseTool, tool
@@ -10,6 +11,7 @@ from pydantic import BaseModel, Field
 from langchain_core.language_models import BaseChatModel
 from langchain.messages import HumanMessage
 
+from ..skills.registry import SkillRegistry
 from ..subagents.registry import SubAgentRegistry
 
 
@@ -93,6 +95,7 @@ class ToolRegistry:
 def get_builtin_tools(
     llm: BaseChatModel,
     subagent_registry: SubAgentRegistry | None = None,
+    skill_registry: SkillRegistry | None = None,
 ) -> list[BaseTool]:
     """创建内置工具列表。"""
 
@@ -172,6 +175,31 @@ def get_builtin_tools(
         return response.content
 
     @tool
+    def reverse_image_prompt(
+        image_path: str,
+        style: Literal["default", "alternative"] = "default",
+        previous_prompt: str = "",
+    ) -> str:
+        """根据图片反推 AI 绘画提示词。用户提供本地图片路径或图片 URL，并要求反推提示词、识图写提示词、图生文描述时调用。
+
+        如果用户基于上一张图要求“换一版提示词”或“再反推一版”，继续调用此工具，
+        style 使用 alternative，并把上一版提示词传入 previous_prompt。
+
+        Args:
+            image_path: 图片本地绝对路径或图片 URL。
+            style: default 表示标准反推，alternative 表示基于同一张图换一版描述。
+            previous_prompt: 上一次反推出的提示词，仅在 style=alternative 时传入。
+        """
+        from ..services.vision import VisionService
+
+        service = VisionService()
+        return service.reverse_prompt(
+            image_path=image_path,
+            style=style,
+            previous_prompt=previous_prompt,
+        )
+
+    @tool
     def load_mcp_tools_tool() -> str:
         """加载 MCP 扩展工具。当用户需要外部 MCP 能力，但当前工具列表还没有具体 MCP 工具时调用。
 
@@ -183,6 +211,46 @@ def get_builtin_tools(
         - 需要先发现线上 MCP server 暴露的工具，再继续选择具体工具
         """
         return LOAD_MCP_TOOLS_SIGNAL
+
+    @tool
+    def read_skill_tool(skill_name: str) -> str:
+        """读取指定 Skill 的完整指令。当用户需求匹配某个 Skill 时，先调用此工具获取详细工作流程。
+
+        Args:
+            skill_name: Skill 名称或别名，例如 weather、polecomic、manga-animation。
+        """
+        if skill_registry is None:
+            return "当前未配置 Skill 注册表，无法读取 Skill。"
+        return skill_registry.get_content(skill_name)
+
+    @tool
+    def bash_tool(command: str, timeout_seconds: int = 30) -> str:
+        """执行 shell 命令并返回输出。仅在 Skill 指令明确要求运行命令时使用。
+
+        Args:
+            command: 要执行的 shell 命令。
+            timeout_seconds: 命令超时时间，范围 1 到 120 秒。
+        """
+        timeout = max(1, min(int(timeout_seconds or 30), 120))
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except subprocess.TimeoutExpired:
+            return f"命令执行超时：超过 {timeout} 秒。"
+
+        output = (result.stdout or "") + (result.stderr or "")
+        if not output.strip():
+            output = f"命令已执行完成，退出码：{result.returncode}"
+        if result.returncode != 0:
+            return f"命令执行失败，退出码：{result.returncode}\n{output.strip()}"
+        return output.strip()
 
     @tool
     def task_tool(description: str, subagent_type: str = "image") -> str:
@@ -221,7 +289,10 @@ def get_builtin_tools(
         generate_images_tool,
         expand_prompt_tool,
         convert_tags_tool,
+        reverse_image_prompt,
         load_mcp_tools_tool,
+        read_skill_tool,
+        bash_tool,
         task_tool,
     ])
     return registry.tools
@@ -234,6 +305,7 @@ def get_available_tools(
     include_mcp: bool = True,
     include_task_tool: bool = True,
     runtime=None,
+    skill_registry: SkillRegistry | None = None,
 ) -> list[BaseTool]:
     """获取调用方可见的工具列表。
 
@@ -248,7 +320,11 @@ def get_available_tools(
 
     from .runtime import build_shared_runtime
 
-    shared_runtime = build_shared_runtime(llm, subagent_registry)
+    shared_runtime = build_shared_runtime(
+        llm,
+        subagent_registry,
+        skill_registry=skill_registry,
+    )
     return shared_runtime.get_tools(
         include_mcp=include_mcp,
         include_task_tool=include_task_tool,
@@ -258,6 +334,7 @@ def get_available_tools(
 def create_tools(
     llm: BaseChatModel,
     subagent_registry: SubAgentRegistry | None = None,
+    skill_registry: SkillRegistry | None = None,
 ) -> list[BaseTool]:
     """创建主Agent可用工具列表。
 
@@ -268,4 +345,5 @@ def create_tools(
         subagent_registry,
         include_mcp=False,
         include_task_tool=True,
+        skill_registry=skill_registry,
     )

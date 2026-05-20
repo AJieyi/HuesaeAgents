@@ -3,6 +3,7 @@
 from langchain.tools import tool
 
 from huesaeagents.huesae.mcp import cache
+from huesaeagents.huesae.skills import SkillRegistry
 from huesaeagents.huesae.subagents.registry import SubAgentRegistry
 from huesaeagents.huesae.tools.runtime import build_shared_runtime
 
@@ -172,3 +173,33 @@ def test_shared_runtime_does_not_load_mcp_until_requested(llm):
     assert len(calls) == 1
     assert runtime.mcp_loaded is True
     assert "fake_mcp_video_tool" in mcp_names
+
+
+def test_shared_runtime_exposes_skill_tools(llm, tmp_path):
+    """共享运行时应暴露 Skill 读取工具，并通过同一个注册表读取内容。"""
+    skill_dir = tmp_path / "weather"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        """---
+name: weather
+description: Get current weather.
+---
+
+# Weather
+Use curl.
+""",
+        encoding="utf-8",
+    )
+
+    runtime = build_shared_runtime(
+        llm,
+        SubAgentRegistry(),
+        mcp_tools_loader=lambda *args, **kwargs: [],
+        skill_registry=SkillRegistry(tmp_path),
+    )
+
+    tool_map = runtime.get_tool_map(include_mcp=False)
+
+    assert "read_skill_tool" in tool_map
+    assert "bash_tool" in tool_map
+    assert "Use curl" in tool_map["read_skill_tool"].invoke({"skill_name": "weather"})

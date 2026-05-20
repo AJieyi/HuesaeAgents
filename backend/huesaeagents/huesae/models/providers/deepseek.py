@@ -30,6 +30,8 @@ def create_deepseek_model(
     if not api_key:
         raise ValueError("DeepSeek API密钥未找到。请配置 DEEPSEEK_API_KEY 环境变量")
 
+    kwargs.setdefault("request_timeout", 120)
+
     return ChatDeepSeek(
         model=model,
         api_key=api_key,

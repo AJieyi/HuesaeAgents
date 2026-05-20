@@ -19,6 +19,7 @@ if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
 from huesaeagents.huesae.agents.lead_agent import HuesaeMainAgent
+from huesaeagents.huesae.skills import SkillRegistry
 from huesaeagents.huesae.subagents.image_agent import (
     ImageDecision,
     ImageSubAgent,
@@ -225,6 +226,11 @@ class FakeToolCallingLLM:
         if latest_tool_result is not None:
             return AIMessage(content=latest_tool_result)
 
+        if user_input == "北京今天天气怎么样":
+            if "read_skill_tool" in self.tool_names:
+                return self._tool_call("read_skill_tool", {"skill_name": "weather"})
+            return AIMessage(content="我需要先读取天气 Skill。")
+
         if user_input == "加载视频MCP":
             if "load_mcp_tools_tool" in self.tool_names:
                 return self._tool_call("load_mcp_tools_tool", {})
@@ -242,6 +248,22 @@ class FakeToolCallingLLM:
             return self._mcp_or_load(
                 "video-capture-script-mcp_analyze_video_content",
                 {"videoPath": VIDEO_PATH},
+            )
+
+        if user_input == f"这张图片{IMAGE_PATH_1}，反推提示词":
+            return self._tool_call(
+                "reverse_image_prompt",
+                {"image_path": IMAGE_PATH_1},
+            )
+
+        if user_input == f"换一版这张图的提示词：{IMAGE_PATH_1}":
+            return self._tool_call(
+                "reverse_image_prompt",
+                {
+                    "image_path": IMAGE_PATH_1,
+                    "style": "alternative",
+                    "previous_prompt": "一位银发少女站在樱花树下",
+                },
             )
 
         if user_input == f"这是本地图片{IMAGE_PATH_1}，请帮我基于图片分析图片内容":
@@ -536,7 +558,10 @@ class TestMainAgentHarness:
         tool_names = {tool.name for tool in main_agent.tools}
         assert "generate_image_tool" not in tool_names
         assert "generate_images_tool" not in tool_names
+        assert "reverse_image_prompt" in tool_names
         assert "load_mcp_tools_tool" in tool_names
+        assert "read_skill_tool" in tool_names
+        assert "bash_tool" in tool_names
         assert "task_tool" in tool_names
 
     def test_image_subagent_registered(self, main_agent):
@@ -562,6 +587,57 @@ class TestMainAgentHarness:
         assert "请以 JSON 格式输出" not in prompt
         assert "generate_image_tool" not in {tool.name for tool in main_agent.tools}
         assert "video-capture-script-mcp_analyze_video_content" not in prompt
+
+    def test_main_prompt_injects_skill_list(self, llm, tmp_path):
+        """主Agent提示词应注入可用 Skill 列表。"""
+        skill_dir = tmp_path / "weather"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            """---
+name: weather
+description: Get current weather.
+---
+
+# Weather
+""",
+            encoding="utf-8",
+        )
+
+        agent = HuesaeMainAgent(
+            llm=llm,
+            mcp_tools_loader=lambda *args, **kwargs: [],
+            skill_registry=SkillRegistry(tmp_path),
+        )
+        prompt = agent._build_system_prompt().content
+
+        assert "## 可用 Skills" in prompt
+        assert "weather" in prompt
+        assert "read_skill_tool" in prompt
+
+    def test_main_agent_reads_skill_before_execution(self, llm, tmp_path):
+        """匹配 Skill 的任务应能调用 read_skill_tool 获取完整指令。"""
+        skill_dir = tmp_path / "weather"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            """---
+name: weather
+description: Get current weather.
+---
+
+# Weather
+使用 wttr.in 查询天气。
+""",
+            encoding="utf-8",
+        )
+
+        agent = HuesaeMainAgent(
+            llm=llm,
+            mcp_tools_loader=lambda *args, **kwargs: [],
+            skill_registry=SkillRegistry(tmp_path),
+        )
+        result = agent.process({"messages": []}, "北京今天天气怎么样")
+
+        assert "wttr.in" in result["messages"][0].content
 
 
 class TestImageSubAgent:
@@ -985,6 +1061,48 @@ class TestMainAgentIntegration:
         assert len(calls) == 1
         assert "视频信息" in result["messages"][0].content
         assert VIDEO_PATH in result["messages"][0].content
+
+    def test_reverse_image_prompt_tool(self, llm):
+        """主Agent应调用识图工具反推图片提示词。"""
+        agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: [])
+
+        @tool("reverse_image_prompt")
+        def fake_reverse_image_prompt(
+            image_path: str,
+            style: str = "default",
+            previous_prompt: str = "",
+        ) -> str:
+            """根据图片反推 AI 绘画提示词。"""
+            return f"反推提示词：{image_path}"
+
+        agent.tool_map["reverse_image_prompt"] = fake_reverse_image_prompt
+        agent.tools.append(fake_reverse_image_prompt)
+
+        result = agent.process({"messages": []}, f"这张图片{IMAGE_PATH_1}，反推提示词")
+
+        assert "反推提示词" in result["messages"][0].content
+        assert IMAGE_PATH_1 in result["messages"][0].content
+
+    def test_reverse_image_prompt_updates_vision_context(self, llm):
+        """识图工具执行后，主Agent应保存轻量图像上下文。"""
+        agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: [])
+
+        @tool("reverse_image_prompt")
+        def reverse_tool(
+            image_path: str,
+            style: str = "default",
+            previous_prompt: str = "",
+        ) -> str:
+            """根据图片反推 AI 绘画提示词。"""
+            return f"反推提示词：{image_path}"
+
+        agent.tool_map["reverse_image_prompt"] = reverse_tool
+        agent.tools.append(reverse_tool)
+
+        result = agent.process({"messages": []}, f"这张图片{IMAGE_PATH_1}，反推提示词")
+
+        assert result.get("vision_context", {}).get("image_path") == IMAGE_PATH_1
+        assert result.get("vision_context", {}).get("last_reverse_prompt") == f"反推提示词：{IMAGE_PATH_1}"
 
     def test_douyin_mcp_download_video(self, llm):
         """主Agent应动态调用抖音 MCP 的下载链接工具。"""

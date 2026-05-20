@@ -2,7 +2,7 @@
 from dotenv import load_dotenv
 from langchain_core.language_models import BaseChatModel
 
-from .providers import create_deepseek_model
+from .providers import DoubaoVisionClient, create_deepseek_model, create_doubao_vision_client
 
 # 加载 .env 文件
 load_dotenv()
@@ -34,3 +34,17 @@ def create_chat_model(
         return create_deepseek_model(model=model, **kwargs)
     else:
         raise ValueError(f"Unsupported provider: {provider}")
+
+
+def create_vision_client(
+    provider: str = "doubao",
+    **kwargs,
+) -> DoubaoVisionClient:
+    """创建视觉理解客户端。
+
+    视觉模型不包装成 LangChain ChatModel，保持和 DeerFlow 类似的独立
+    provider + 工厂结构，避免把图片 base64 混入普通对话消息。
+    """
+    if provider == "doubao":
+        return create_doubao_vision_client(**kwargs)
+    raise ValueError(f"Unsupported vision provider: {provider}")

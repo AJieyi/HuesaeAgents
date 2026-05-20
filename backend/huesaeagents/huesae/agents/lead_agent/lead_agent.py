@@ -15,6 +15,7 @@ from langchain.messages import HumanMessage, AIMessage, SystemMessage, ToolMessa
 
 from ...subagents.base import BaseSubAgent
 from ...subagents.registry import SubAgentRegistry
+from ...skills.registry import SkillRegistry
 from ...tools.runtime import MAIN_AGENT_EXCLUDED_TOOL_NAMES, build_shared_runtime
 from ...tools.tools import (
     LOAD_MCP_TOOLS_SIGNAL,
@@ -29,6 +30,15 @@ _SAFE_KEYWORDS = [
     "自杀", "自残", "想死", "不想活", "结束生命", "活着没意思",
     "kill myself", "suicide", "self-harm",
 ]
+
+_FALLBACK_RESPONSE = "抱歉，我刚刚有点卡住了，请稍后再试一次，或者把需求再发我一遍。"
+
+IMAGE_CONTEXT_PATH_KEYS = (
+    "image_path",
+    "image_paths",
+    "last_image_path",
+    "last_image_paths",
+)
 
 
 # ============== 主Agent ==============
@@ -52,16 +62,21 @@ class HuesaeMainAgent:
         llm: BaseChatModel,
         character_id: str = "gentle_sister",
         mcp_tools_loader=None,
+        skill_registry: SkillRegistry | None = None,
     ):
         self.llm = llm
         self.character_id = character_id
+        self.skill_registry = skill_registry
         self.subagent_registry = SubAgentRegistry()
         runtime_kwargs = {}
         if mcp_tools_loader is not None:
             runtime_kwargs["mcp_tools_loader"] = mcp_tools_loader
+        if skill_registry is not None:
+            runtime_kwargs["skill_registry"] = skill_registry
         self._runtime = build_shared_runtime(self.llm, self.subagent_registry, **runtime_kwargs)
         self.tools = []
         self.tool_map = {}
+        self._vision_context: dict = {}
         self._refresh_tools()
 
     def _refresh_tools(self) -> None:
@@ -70,6 +85,7 @@ class HuesaeMainAgent:
         子Agent注册变化会影响 task_tool 的可用描述，因此注册后刷新一次。
         """
         self._runtime.subagent_registry = self.subagent_registry
+        self._runtime.skill_registry = self.skill_registry
         self._runtime.refresh_builtin_tools()
         self.tools = self._runtime.get_tools(
             include_mcp=False,
@@ -85,6 +101,7 @@ class HuesaeMainAgent:
     def _refresh_tools_with_mcp(self) -> None:
         """懒加载 MCP 工具后刷新完整工具视图。"""
         self._runtime.subagent_registry = self.subagent_registry
+        self._runtime.skill_registry = self.skill_registry
         self._runtime.refresh_builtin_tools()
         self.tools = self._runtime.get_tools(
             include_mcp=True,
@@ -105,6 +122,7 @@ class HuesaeMainAgent:
         # 通用子Agent后续可通过 runtime 读取共享工具池；
         # 子Agent视图应使用 include_task_tool=False，避免子Agent继续委派子Agent。
         agent.runtime = self._runtime
+        agent.skill_registry = self.skill_registry
         self.subagent_registry.register(agent, description=description)
         self._refresh_tools()
 
@@ -132,6 +150,8 @@ class HuesaeMainAgent:
             return self._handle_subagent(state, user_input)
 
         # 3. LangChain 原生函数调用循环
+        image_context = self._extract_vision_context(state)
+        self._vision_context = image_context
         working_messages = self._build_messages(state, user_input)
         tool_results: list[str] = []
 
@@ -140,12 +160,18 @@ class HuesaeMainAgent:
                 ai_message = self._invoke_with_tools(working_messages)
             except Exception:
                 # 降级处理：函数调用失败时直接聊天。
-                chat_response = self._chat_reply(state, user_input)
-                return {"messages": [AIMessage(content=chat_response)]}
+                return {
+                    "messages": [AIMessage(content=_FALLBACK_RESPONSE)],
+                    "vision_context": image_context,
+                }
 
             tool_calls = getattr(ai_message, "tool_calls", None) or []
             if not tool_calls:
-                return {"messages": [AIMessage(content=str(ai_message.content or ""))]}
+                self._vision_context = image_context
+                return {
+                    "messages": [AIMessage(content=str(ai_message.content or ""))],
+                    "vision_context": image_context,
+                }
 
             working_messages.append(ai_message)
             for tool_call in tool_calls:
@@ -157,6 +183,7 @@ class HuesaeMainAgent:
                 if is_load_mcp_tools_signal(result):
                     if not self._runtime.mcp_loaded:
                         self._refresh_tools_with_mcp()
+                    working_messages[0] = self._build_system_prompt()
                     result = (
                         "MCP扩展工具已加载。请结合用户原始需求，根据更新后的工具列表重新选择最合适的具体工具，"
                         "并严格使用工具 schema 中的参数名。"
@@ -170,15 +197,19 @@ class HuesaeMainAgent:
                 result_text = str(result)
                 tool_results.append(result_text)
                 working_messages.append(ToolMessage(content=result_text, tool_call_id=tool_call_id))
+                image_context = self._update_vision_context(image_context, tool_name, tool_args, result_text)
 
             working_messages[0] = self._build_system_prompt()
+            self._vision_context = image_context
 
         if tool_results:
-            return {"messages": [AIMessage(content=self._format_last_tool_result(tool_results[-1]))]}
+            return {
+                "messages": [AIMessage(content=self._format_last_tool_result(tool_results[-1]))],
+                "vision_context": image_context,
+            }
 
         # 超过最大步数且没有工具结果时，降级到直接聊天。
-        chat_response = self._chat_reply(state, user_input)
-        return {"messages": [AIMessage(content=chat_response)]}
+        return {"messages": [AIMessage(content=_FALLBACK_RESPONSE)], "vision_context": image_context}
 
     # ============== 系统提示词构建 ==============
 
@@ -198,6 +229,12 @@ class HuesaeMainAgent:
         )
         mcp_tool_principles = self._runtime.format_mcp_tool_principles()
         subagents_description = self.subagent_registry.format_for_prompt()
+        skills_section = (
+            self.skill_registry.format_for_prompt()
+            if self.skill_registry is not None
+            else "暂无可用 Skills。"
+        )
+        vision_context_section = self._format_vision_context_for_prompt(self._get_vision_context())
 
         return build_main_system_message(
             character_id=self.character_id,
@@ -205,6 +242,8 @@ class HuesaeMainAgent:
             tool_constraints=tool_constraints,
             mcp_tool_principles=mcp_tool_principles,
             subagents_description=subagents_description,
+            skills_section=skills_section,
+            vision_context_section=vision_context_section,
         )
 
     def _build_messages(self, state: dict, user_input: str) -> list:
@@ -276,6 +315,7 @@ class HuesaeMainAgent:
             "messages": [],
             "image_task_type": "generate_image",
             "image_phase": "collecting_prompt",
+            "skill_registry": self.skill_registry,
         }
         if initial_state:
             sub_state.update(initial_state)
@@ -445,8 +485,80 @@ class HuesaeMainAgent:
 
         character_msg = get_character_system_message(self.character_id)
         messages = [character_msg] + state.get("messages", []) + [HumanMessage(content=user_input)]
-        response = self.llm.invoke(messages)
-        return response.content
+        try:
+            response = self.llm.invoke(messages)
+            return response.content
+        except Exception:
+            return _FALLBACK_RESPONSE
+
+    def _extract_vision_context(self, state: dict) -> dict:
+        """从状态中提取图像上下文。"""
+        vision_context = state.get("vision_context")
+        if isinstance(vision_context, dict):
+            return vision_context
+        if self._vision_context:
+            return dict(self._vision_context)
+        return {}
+
+    def _get_vision_context(self) -> dict:
+        """从运行时缓存中读取图像上下文。"""
+        return getattr(self, "_vision_context", {}) or {}
+
+    def _update_vision_context(self, image_context: dict, tool_name: str, tool_args: dict, result_text: str) -> dict:
+        """根据识图工具结果更新轻量图像上下文。"""
+        updated = dict(image_context or {})
+        if tool_name == "reverse_image_prompt":
+            image_path = str(tool_args.get("image_path") or "").strip()
+            if image_path:
+                updated["image_path"] = image_path
+            updated["last_reverse_prompt"] = result_text
+            updated["last_vision_tool"] = tool_name
+        elif self._looks_like_image_input(tool_name, tool_args):
+            paths = self._collect_image_paths(tool_args)
+            if paths:
+                updated["image_path"] = paths[-1]
+                updated["image_paths"] = paths
+            updated["last_vision_tool"] = tool_name
+        self._vision_context = updated
+        return updated
+
+    def _looks_like_image_input(self, tool_name: str, tool_args: dict) -> bool:
+        """判断当前工具调用是否带有图片路径。"""
+        if tool_name == "reverse_image_prompt":
+            return True
+        return any(key in tool_args for key in IMAGE_CONTEXT_PATH_KEYS)
+
+    def _collect_image_paths(self, tool_args: dict) -> list[str]:
+        """把工具参数中的图片路径收集成列表。"""
+        collected: list[str] = []
+        for key in ("image_path", "last_image_path"):
+            value = tool_args.get(key)
+            if isinstance(value, str) and value.strip():
+                collected.append(value.strip())
+        for key in ("image_paths", "last_image_paths"):
+            values = tool_args.get(key)
+            if isinstance(values, list):
+                for value in values:
+                    if isinstance(value, str) and value.strip():
+                        collected.append(value.strip())
+        return collected
+
+    @staticmethod
+    def _format_vision_context_for_prompt(vision_context: dict) -> str:
+        """把图像上下文压缩成系统提示词可读的摘要。"""
+        if not vision_context:
+            return "暂无图像上下文。"
+        lines = ["当前图像上下文："]
+        image_path = vision_context.get("image_path")
+        if image_path:
+            lines.append(f"- 最近图片路径：{image_path}")
+        image_paths = vision_context.get("image_paths")
+        if image_paths:
+            lines.append(f"- 最近图片列表：{image_paths}")
+        last_prompt = vision_context.get("last_reverse_prompt")
+        if last_prompt:
+            lines.append(f"- 最近反推提示词：{last_prompt}")
+        return "\n".join(lines)
 
     # ============== 安全处理 ==============
 
@@ -474,6 +586,7 @@ def create_main_agent(
     llm: BaseChatModel | None = None,
     character_id: str = "gentle_sister",
     mcp_tools_loader=None,
+    skill_registry: SkillRegistry | None = None,
 ) -> HuesaeMainAgent:
     """创建主Agent工厂函数
 
@@ -495,4 +608,5 @@ def create_main_agent(
         llm=llm,
         character_id=character_id,
         mcp_tools_loader=mcp_tools_loader,
+        skill_registry=skill_registry,
     )
