@@ -57,6 +57,10 @@ web/
 # Markdown documents
 *.md
 
+# Local Honcho/session state
+.state/
+backend/huesaeagents/huesae/.pytest_tmp/
+
 # Deployment artifacts
 backend/Dockerfile.langgraph
 config.yaml.bak

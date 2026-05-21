@@ -20,6 +20,7 @@ if str(backend_dir) not in sys.path:
 
 from huesaeagents.huesae.agents.lead_agent import HuesaeMainAgent
 from huesaeagents.huesae.skills import SkillRegistry
+from huesaeagents.huesae.services.memory import HonchoMemoryService
 from huesaeagents.huesae.subagents.image_agent import (
     ImageDecision,
     ImageSubAgent,
@@ -1151,6 +1152,25 @@ class TestMainAgentIntegration:
         assert len(calls) == 1
         assert "视频信息" in result["messages"][0].content
         assert VIDEO_PATH in result["messages"][0].content
+
+    def test_main_agent_injects_memory_into_prompt(self, llm):
+        """主Agent应把 Honcho 记忆注入系统提示词。"""
+
+        class _FakeMemory:
+            enabled = True
+            user_input = None
+
+            def get_context(self, user_input=None):
+                self.user_input = user_input
+                return "记忆：用户喜欢猫"
+
+        memory = _FakeMemory()
+        agent = HuesaeMainAgent(llm=llm, memory_service=memory)
+        prompt = agent._build_system_prompt("我喜欢什么动物？").content
+
+        assert "用户喜欢猫" in prompt
+        assert "Honcho 长期记忆 / 持久记忆" in prompt
+        assert memory.user_input == "我喜欢什么动物？"
 
 
 class TestDanbooruTags:

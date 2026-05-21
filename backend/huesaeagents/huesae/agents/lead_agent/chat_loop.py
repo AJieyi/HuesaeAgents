@@ -59,14 +59,16 @@ def run_chat_loop():
     """
     from .lead_agent import create_main_agent
     from ...skills.registry import SkillRegistry
+    from ...services import create_honcho_memory_service
     from ...subagents.image_agent import create_image_agent
 
     # 创建主Agent并注册子Agent
     skill_registry = SkillRegistry()
-    main_agent = create_main_agent(skill_registry=skill_registry)
+    memory_service = create_honcho_memory_service()
+    main_agent = create_main_agent(skill_registry=skill_registry, memory_service=memory_service)
     main_agent.register_sub_agent(create_image_agent())
 
-    # 终端交互只保留当前进程内的临时对话状态。
+    # 终端交互保留当前进程状态，同时把跨终端记忆写入 Honcho。
     messages = []
     active_subagent = None
     vision_context = None
@@ -78,6 +80,9 @@ def run_chat_loop():
     print("  - 输入消息与Agent对话")
     print("  - 说'我想生成图片'进入生图模式")
     print("  - 输入 exit/quit 退出\n")
+    print(f"记忆状态：{memory_service.status}")
+    if memory_service.enabled and memory_service.session_id:
+        print(f"记忆会话：{memory_service.session_id}\n")
 
     while True:
         try:
@@ -175,6 +180,15 @@ def run_chat_loop():
             active_subagent = None
         if "vision_context" in result:
             vision_context = result["vision_context"]
+
+        assistant_response = "\n".join(
+            msg.content if hasattr(msg, "content") else str(msg)
+            for msg in result.get("messages", [])
+            if str(getattr(msg, "content", msg)).strip()
+        ).strip()
+
+        if assistant_response:
+            memory_service.store_exchange(user_input, assistant_response)
 
         # 更新主对话历史
         messages.append(HumanMessage(content=user_input))

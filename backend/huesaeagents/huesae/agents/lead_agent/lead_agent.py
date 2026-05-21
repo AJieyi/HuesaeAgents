@@ -15,6 +15,7 @@ from langchain.messages import HumanMessage, AIMessage, SystemMessage, ToolMessa
 
 from ...subagents.base import BaseSubAgent
 from ...subagents.registry import SubAgentRegistry
+from ...services import HonchoMemoryService
 from ...skills.registry import SkillRegistry
 from ...tools.runtime import MAIN_AGENT_EXCLUDED_TOOL_NAMES, build_shared_runtime
 from ...tools.tools import (
@@ -63,10 +64,12 @@ class HuesaeMainAgent:
         character_id: str = "gentle_sister",
         mcp_tools_loader=None,
         skill_registry: SkillRegistry | None = None,
+        memory_service: HonchoMemoryService | None = None,
     ):
         self.llm = llm
         self.character_id = character_id
         self.skill_registry = skill_registry
+        self.memory_service = memory_service
         self.subagent_registry = SubAgentRegistry()
         runtime_kwargs = {}
         if mcp_tools_loader is not None:
@@ -183,7 +186,7 @@ class HuesaeMainAgent:
                 if is_load_mcp_tools_signal(result):
                     if not self._runtime.mcp_loaded:
                         self._refresh_tools_with_mcp()
-                    working_messages[0] = self._build_system_prompt()
+                    working_messages[0] = self._build_system_prompt(user_input)
                     result = (
                         "MCP扩展工具已加载。请结合用户原始需求，根据更新后的工具列表重新选择最合适的具体工具，"
                         "并严格使用工具 schema 中的参数名。"
@@ -199,7 +202,7 @@ class HuesaeMainAgent:
                 working_messages.append(ToolMessage(content=result_text, tool_call_id=tool_call_id))
                 image_context = self._update_vision_context(image_context, tool_name, tool_args, result_text)
 
-            working_messages[0] = self._build_system_prompt()
+            working_messages[0] = self._build_system_prompt(user_input)
             self._vision_context = image_context
 
         if tool_results:
@@ -213,7 +216,7 @@ class HuesaeMainAgent:
 
     # ============== 系统提示词构建 ==============
 
-    def _build_system_prompt(self) -> SystemMessage:
+    def _build_system_prompt(self, user_input: str | None = None) -> SystemMessage:
         """构建含工具描述的系统提示词"""
         from .prompts import build_main_system_message
 
@@ -234,6 +237,11 @@ class HuesaeMainAgent:
             if self.skill_registry is not None
             else "暂无可用 Skills。"
         )
+        memory_context_section = (
+            self._get_memory_context(user_input)
+            if self.memory_service is not None and self.memory_service.enabled
+            else "暂无可用用户记忆。"
+        )
         vision_context_section = self._format_vision_context_for_prompt(self._get_vision_context())
 
         return build_main_system_message(
@@ -243,15 +251,25 @@ class HuesaeMainAgent:
             mcp_tool_principles=mcp_tool_principles,
             subagents_description=subagents_description,
             skills_section=skills_section,
+            memory_context_section=memory_context_section,
             vision_context_section=vision_context_section,
         )
 
     def _build_messages(self, state: dict, user_input: str) -> list:
         """构建函数调用循环所需消息。"""
-        messages = [self._build_system_prompt()]
+        messages = [self._build_system_prompt(user_input)]
         messages.extend(state.get("messages", [])[-10:])
         messages.append(HumanMessage(content=user_input))
         return messages
+
+    def _get_memory_context(self, user_input: str | None) -> str:
+        """Fetch Honcho memory, using the current user input as a retrieval query."""
+        if self.memory_service is None:
+            return "暂无可用用户记忆。"
+        try:
+            return self.memory_service.get_context(user_input=user_input)
+        except TypeError:
+            return self.memory_service.get_context()
 
     def _invoke_with_tools(self, messages: list) -> AIMessage:
         """使用 LangChain 原生工具绑定调用模型。"""
@@ -587,6 +605,7 @@ def create_main_agent(
     character_id: str = "gentle_sister",
     mcp_tools_loader=None,
     skill_registry: SkillRegistry | None = None,
+    memory_service: HonchoMemoryService | None = None,
 ) -> HuesaeMainAgent:
     """创建主Agent工厂函数
 
@@ -609,4 +628,5 @@ def create_main_agent(
         character_id=character_id,
         mcp_tools_loader=mcp_tools_loader,
         skill_registry=skill_registry,
+        memory_service=memory_service,
     )

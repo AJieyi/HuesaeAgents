@@ -34,6 +34,9 @@ MAIN_AGENT_SYSTEM_PROMPT = """你是 HuesaeAgents 的主Agent，负责理解用�
 ## 可用 Skills
 {skills_section}
 
+## Honcho 长期记忆 / 持久记忆
+{memory_context_section}
+
 ## 工作原则
 1. 仔细分析用户需求，选择最合适的工具或直接回复。
 2. 需要工具时使用 LangChain 函数调用，不要把工具调用写成普通文本。
@@ -45,6 +48,8 @@ MAIN_AGENT_SYSTEM_PROMPT = """你是 HuesaeAgents 的主Agent，负责理解用�
 8. Skill 是“如何完成任务”的说明，不是普通函数工具；不要只看 Skill 名称就跳过读取步骤。
 9. 用户需求模糊且缺少必要信息时，先追问澄清。
 10. 调用工具后，基于工具结果给用户友好的回复。
+11. Honcho 记忆区块来自外部持久记忆层，包含用户画像、长期结论、会话摘要和相关近期消息；回答涉及用户偏好、身份、历史上下文时优先参考它，再结合本轮本地对话历史。
+12. 如果 Honcho 记忆区块明确提示记忆服务不可用，不要声称已经记得用户信息。
 
 ## 图像上下文
 {vision_context_section}
@@ -77,6 +82,7 @@ def build_main_system_message(
     mcp_tool_principles: str,
     subagents_description: str,
     skills_section: str = "暂无可用 Skills。",
+    memory_context_section: str = "暂无可用用户记忆。",
     vision_context_section: str = "暂无图像上下文。",
 ) -> SystemMessage:
     """构建主Agent系统提示词。
@@ -92,6 +98,7 @@ def build_main_system_message(
         mcp_tool_principles=mcp_tool_principles,
         subagents_description=subagents_description,
         skills_section=skills_section,
+        memory_context_section=memory_context_section,
         vision_context_section=vision_context_section,
     )
     return SystemMessage(content=content)
