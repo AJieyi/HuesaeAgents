@@ -33,6 +33,11 @@ from huesaeagents.huesae.config import (
 )
 from huesaeagents.huesae.skills import SkillRegistry
 from huesaeagents.huesae.services.memory import HonchoMemoryService
+from huesaeagents.huesae.subagents.general_agent import (
+    GeneralSubAgent,
+    create_general_agent,
+)
+from huesaeagents.huesae.subagents.base import BaseSubAgent
 from huesaeagents.huesae.subagents.image_agent import (
     ImageDecision,
     ImageSubAgent,
@@ -44,6 +49,7 @@ from huesaeagents.huesae.subagents.image import (
     expand_prompt,
     generate_tags,
 )
+from huesaeagents.huesae.tools.runtime import build_shared_runtime
 VIDEO_PATH = "F:/videos/demo.mp4"
 IMAGE_PATH_1 = "F:/images/a.png"
 IMAGE_PATH_2 = "F:/images/b.png"
@@ -309,6 +315,18 @@ class FakeToolCallingLLM:
                 {"videoPath": VIDEO_PATH},
             )
 
+        if user_input == "帮我整理一份报告":
+            if "task_tool" in self.tool_names:
+                return self._tool_call(
+                    "task_tool",
+                    {"description": user_input, "subagent_type": "general"},
+                )
+            if "general_echo_tool" in self.tool_names:
+                return self._tool_call(
+                    "general_echo_tool",
+                    {"text": user_input},
+                )
+
         if user_input == f"{DOUYIN_URL}，下载视频":
             return self._mcp_or_load(
                 "douyin-mcp-server_get_douyin_download_link",
@@ -511,6 +529,12 @@ def _fake_all_platform_mcp_tools():
     return _fake_video_mcp_tools() + _fake_douyin_mcp_tools() + _fake_bilibili_mcp_tools()
 
 
+@tool("general_echo_tool")
+def fake_general_echo_tool(text: str) -> str:
+    """通用子Agent用的测试工具。"""
+    return f"通用任务结果：{text}"
+
+
 @tool("bilibili-mcp_parse_bilibili_video")
 def fake_fysh_parse_bilibili_video(url: str) -> str:
     """解析B站视频链接。"""
@@ -554,6 +578,7 @@ def main_agent(llm):
     """共享的主Agent实例。"""
     agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: [])
     agent.register_sub_agent(create_image_agent(llm=llm, providers=[]))
+    agent.register_sub_agent(create_general_agent(llm=llm, runtime=agent._runtime))
     return agent
 
 
@@ -1183,6 +1208,51 @@ class TestMainAgentIntegration:
         assert "用户喜欢猫" in prompt
         assert "Honcho 长期记忆 / 持久记忆" in prompt
         assert memory.user_input == "我喜欢什么动物？"
+
+    def test_delegate_to_general_agent(self, llm):
+        """复杂通用任务应委派给 general 子Agent。"""
+        agent = HuesaeMainAgent(
+            llm=llm,
+            mcp_tools_loader=lambda *args, **kwargs: [],
+        )
+        
+        class _StubGeneralAgent(BaseSubAgent):
+            @property
+            def name(self):
+                return "general"
+
+            def process(self, state: dict, user_input: str) -> dict:
+                return {
+                    "action": "finish",
+                    "response": "通用任务结果：已完成报告整理",
+                    "prompt": None,
+                    "provider": None,
+                    "data": {},
+                }
+
+        agent.register_sub_agent(_StubGeneralAgent())
+
+        result = agent.process({"messages": []}, "帮我整理一份报告")
+
+        assert result.get("clear_subagent") is True
+        assert "通用任务结果" in result["messages"][0].content
+
+
+class TestGeneralSubAgent:
+    """测试通用子Agent。"""
+
+    def test_general_agent_can_run_tool_then_finish(self, llm):
+        """通用子Agent应能调用工具并在完成后结束。"""
+        runtime = build_shared_runtime(llm, skill_registry=SkillRegistry())
+        general_agent = GeneralSubAgent(llm=llm, runtime=runtime, skill_registry=SkillRegistry())
+        runtime.refresh_builtin_tools = lambda: None
+        runtime.get_tools = lambda **kwargs: [fake_general_echo_tool]
+        runtime.get_tool_map = lambda **kwargs: {"general_echo_tool": fake_general_echo_tool}
+
+        result = general_agent.process({"messages": []}, "帮我整理一份报告")
+
+        assert result["action"] == "finish"
+        assert "通用任务结果" in result["response"]
 
 
 class TestAgentMiddlewares:

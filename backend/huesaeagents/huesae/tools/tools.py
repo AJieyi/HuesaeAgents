@@ -260,13 +260,17 @@ def get_builtin_tools(
         - 用户表达生图需求但没有提供具体描述（需要追问）
         - 用户要求推荐图片主题
         - 需要多轮确认的生图流程
+        - 需要4步以上工具调用、信息整合、资料加工、报告生成等复杂通用任务
+        - 需要外部数据查询并进行整理、改写或总结
+        - 最终产物是文件、代码、报告或复杂结果文本
 
         支持的子Agent：
         - image: 生图对话Agent，处理追问、推荐、扩写、确认、生图完整流程
+        - general: 通用任务Agent，处理复杂通用任务、工具链执行和结果汇总
 
         Args:
             description: 任务描述，即用户原始输入
-            subagent_type: 子Agent类型，当前支持 "image"
+            subagent_type: 子Agent类型，当前支持 "image" 或 "general"
         """
         if subagent_registry is not None and subagent_type not in subagent_registry.names():
             available = ", ".join(subagent_registry.names()) or "无"

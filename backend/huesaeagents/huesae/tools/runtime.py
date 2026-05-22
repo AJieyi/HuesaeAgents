@@ -15,6 +15,7 @@ from ..subagents.registry import SubAgentRegistry
 
 
 MAIN_AGENT_EXCLUDED_TOOL_NAMES = frozenset({"generate_image_tool", "generate_images_tool"})
+GENERAL_AGENT_EXCLUDED_TOOL_NAMES = frozenset({"generate_image_tool", "generate_images_tool"})
 
 
 class SharedToolRuntime:

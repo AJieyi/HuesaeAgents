@@ -15,6 +15,7 @@ from langchain.messages import HumanMessage, AIMessage, SystemMessage, ToolMessa
 
 from ..middlewares import MiddlewarePipeline, build_middlewares
 from ...subagents.base import BaseSubAgent
+from ...subagents.general_agent import GeneralSubAgent
 from ...subagents.registry import SubAgentRegistry
 from ...services import HonchoMemoryService
 from ...skills.registry import SkillRegistry
@@ -125,6 +126,8 @@ class HuesaeMainAgent:
         description = None
         if agent.name == "image":
             description = "生图对话Agent，处理追问、推荐、扩写、确认、单图和组图生成。"
+        elif agent.name == "general":
+            description = "通用任务Agent，处理复杂通用任务、工具链执行、资料加工和结果汇总。"
         # 通用子Agent后续可通过 runtime 读取共享工具池；
         # 子Agent视图应使用 include_task_tool=False，避免子Agent继续委派子Agent。
         agent.runtime = self._runtime
@@ -393,12 +396,18 @@ class HuesaeMainAgent:
             }
 
         # 创建子Agent的初始状态
-        sub_state = {
-            "messages": [],
-            "image_task_type": "generate_image",
-            "image_phase": "collecting_prompt",
-            "skill_registry": self.skill_registry,
-        }
+        if subagent_type == "general":
+            sub_state = {
+                "messages": [],
+                "skill_registry": self.skill_registry,
+            }
+        else:
+            sub_state = {
+                "messages": [],
+                "image_task_type": "generate_image",
+                "image_phase": "collecting_prompt",
+                "skill_registry": self.skill_registry,
+            }
         if initial_state:
             sub_state.update(initial_state)
 
@@ -456,6 +465,13 @@ class HuesaeMainAgent:
         """把子Agent标准结果转换成主Agent对外返回格式。"""
         action = sub_result.get("action", "")
         response = sub_result.get("response", "")
+        agent_type = subagent_context.get("agent_type", "")
+
+        if agent_type == "general":
+            return {
+                "messages": [AIMessage(content=response)],
+                "clear_subagent": True,
+            }
 
         if action in ("ask_prompt", "recommend", "ask_confirm"):
             return {

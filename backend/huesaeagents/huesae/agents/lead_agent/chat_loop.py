@@ -82,6 +82,7 @@ def run_chat_loop():
     from .lead_agent import create_main_agent
     from ...skills.registry import SkillRegistry
     from ...services import create_honcho_memory_service
+    from ...subagents.general_agent import create_general_agent
     from ...subagents.image_agent import create_image_agent
 
     # 创建主Agent并注册子Agent
@@ -89,6 +90,7 @@ def run_chat_loop():
     memory_service = create_honcho_memory_service()
     main_agent = create_main_agent(skill_registry=skill_registry, memory_service=memory_service)
     main_agent.register_sub_agent(create_image_agent())
+    main_agent.register_sub_agent(create_general_agent(skill_registry=skill_registry, runtime=main_agent._runtime))
 
     # 终端交互保留当前进程状态，同时把跨终端记忆写入 Honcho。
     messages = []
