@@ -19,6 +19,18 @@ if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
 from huesaeagents.huesae.agents.lead_agent import HuesaeMainAgent
+from huesaeagents.huesae.agents.middlewares import (
+    AgentMiddleware,
+    MiddlewarePipeline,
+    TokenUsageMiddleware,
+    build_middlewares,
+)
+from huesaeagents.huesae.config import (
+    MiddlewareConfig,
+    TokenUsageConfig,
+    reset_middleware_config,
+    set_middleware_config,
+)
 from huesaeagents.huesae.skills import SkillRegistry
 from huesaeagents.huesae.services.memory import HonchoMemoryService
 from huesaeagents.huesae.subagents.image_agent import (
@@ -1171,6 +1183,111 @@ class TestMainAgentIntegration:
         assert "用户喜欢猫" in prompt
         assert "Honcho 长期记忆 / 持久记忆" in prompt
         assert memory.user_input == "我喜欢什么动物？"
+
+
+class TestAgentMiddlewares:
+    """测试 DeerFlow 风格中间件管道。"""
+
+    def test_pipeline_runs_hooks_in_order(self):
+        """Pipeline 应按生命周期顺序执行中间件钩子。"""
+        calls = []
+
+        class _RecordingMiddleware(AgentMiddleware):
+            def before_agent(self, state, runtime):
+                calls.append(("before_agent", state["user_input"]))
+
+            def before_model(self, state, runtime):
+                calls.append(("before_model", state["step"]))
+
+            def after_model(self, state, runtime):
+                calls.append(("after_model", state["messages"][-1].content))
+
+            def after_agent(self, state, runtime):
+                calls.append(("after_agent", state["result"]["messages"][0].content))
+
+        pipeline = MiddlewarePipeline([_RecordingMiddleware()])
+        state = pipeline.run_before_agent({"messages": [], "user_input": "你好"})
+        state["step"] = 0
+        state = pipeline.run_before_model(state)
+        state["messages"] = [AIMessage(content="模型回复")]
+        state = pipeline.run_after_model(state)
+        state["result"] = {"messages": [AIMessage(content="最终回复")]}
+        pipeline.run_after_agent(state)
+
+        assert calls == [
+            ("before_agent", "你好"),
+            ("before_model", 0),
+            ("after_model", "模型回复"),
+            ("after_agent", "最终回复"),
+        ]
+
+    def test_pipeline_appends_message_updates(self):
+        """中间件返回 messages 时应使用追加语义。"""
+
+        class _AppendMessageMiddleware(AgentMiddleware):
+            def before_model(self, state, runtime):
+                return {"messages": [HumanMessage(content="补充消息")], "flag": True}
+
+        pipeline = MiddlewarePipeline([_AppendMessageMiddleware()])
+        state = pipeline.run_before_model({"messages": [HumanMessage(content="原始消息")]})
+
+        assert [message.content for message in state["messages"]] == ["原始消息", "补充消息"]
+        assert state["flag"] is True
+
+    def test_token_usage_middleware_logs_usage(self, caplog):
+        """TokenUsageMiddleware 应记录 AIMessage usage_metadata。"""
+        middleware = TokenUsageMiddleware()
+        message = AIMessage(
+            content="你好",
+            usage_metadata={"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+        )
+
+        with caplog.at_level("INFO"):
+            middleware.after_model({"messages": [message]}, runtime=None)
+
+        assert "LLM token usage: input=3 output=4 total=7" in caplog.text
+
+    def test_build_middlewares_respects_token_usage_config(self):
+        """关闭配置后不应组装 TokenUsageMiddleware。"""
+        try:
+            set_middleware_config(
+                MiddlewareConfig(token_usage=TokenUsageConfig(enabled=False))
+            )
+            pipeline = build_middlewares()
+
+            assert not any(
+                isinstance(middleware, TokenUsageMiddleware)
+                for middleware in pipeline.middlewares
+            )
+        finally:
+            reset_middleware_config()
+
+    def test_main_agent_invokes_middleware_around_model(self, llm):
+        """主Agent ReAct 模型调用前后应触发中间件。"""
+        calls = []
+
+        class _MainAgentMiddleware(AgentMiddleware):
+            def before_agent(self, state, runtime):
+                calls.append("before_agent")
+
+            def before_model(self, state, runtime):
+                calls.append("before_model")
+
+            def after_model(self, state, runtime):
+                calls.append("after_model")
+
+            def after_agent(self, state, runtime):
+                calls.append("after_agent")
+
+        agent = HuesaeMainAgent(
+            llm=llm,
+            mcp_tools_loader=lambda *args, **kwargs: [],
+            middleware_pipeline=MiddlewarePipeline([_MainAgentMiddleware()]),
+        )
+        result = agent.process({"messages": []}, "你好")
+
+        assert "你好呀" in result["messages"][0].content
+        assert calls == ["before_agent", "before_model", "after_model", "after_agent"]
 
 
 class TestDanbooruTags:

@@ -8,6 +8,10 @@ DeerFlow Harness Engineering 模式：
 对话流：
     用户输入 → 主Agent ReAct 循环 → [直接回复 | 调用工具 | 委托子Agent]
     工具/子Agent完成 → 主Agent包装展示 → 继续对话
+
+永久关闭token用量，改 chat_loop.py 这一行默认值：
+os.getenv("HUESAE_SHOW_TOKEN_USAGE_LOGS", "1")
+
 """
 # 修复直接运行时的包路径（python chat_loop.py）
 if __package__ is None:
@@ -20,6 +24,8 @@ if __package__ is None:
     __package__ = "huesaeagents.huesae.agents.lead_agent"
 
 import asyncio
+import logging
+import os
 import time
 import warnings
 
@@ -31,6 +37,20 @@ warnings.filterwarnings(
 )
 
 from langchain.messages import HumanMessage, AIMessage
+
+
+def configure_chat_loop_logging() -> None:
+    """配置终端日志，让 TokenUsageMiddleware 的 token 用量能在 chat_loop 中显示。"""
+    show_token_usage_logs = os.getenv("HUESAE_SHOW_TOKEN_USAGE_LOGS", "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    logging.basicConfig(
+        level=logging.INFO if show_token_usage_logs else logging.WARNING,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
 
 
 def print_stream(text: str, prefix: str = "AI: ", delay: float = 0.025) -> None:
@@ -57,6 +77,8 @@ def run_chat_loop():
     - 生图时先显示"生成中"提示，完成后展示图片
     - 输入 exit/quit 退出
     """
+    configure_chat_loop_logging()
+
     from .lead_agent import create_main_agent
     from ...skills.registry import SkillRegistry
     from ...services import create_honcho_memory_service

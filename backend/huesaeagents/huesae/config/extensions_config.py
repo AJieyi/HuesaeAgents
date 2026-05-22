@@ -1,6 +1,6 @@
 """扩展配置。
 
-当前只实现 MCP server 配置读取，保持 deerflow 风格的可选扩展机制：
+当前只实现 MCP server 配置读取，保持 harness 风格的可选扩展机制：
 配置不存在或 MCP 加载失败时，不影响内置工具与主Agent启动。
 """
 

@@ -87,7 +87,7 @@ def build_main_system_message(
 ) -> SystemMessage:
     """构建主Agent系统提示词。
 
-    采用 deerflow 风格的大模板加动态占位符，工具名称和参数由
+    采用 harness 风格的大模板加动态占位符，工具名称和参数由
     LangChain 函数调用 schema 提供，提示词只负责稳定边界与工作原则。
     """
     character_msg = get_character_system_message(character_id)

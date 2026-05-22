@@ -13,6 +13,7 @@
 from langchain_core.language_models import BaseChatModel
 from langchain.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 
+from ..middlewares import MiddlewarePipeline, build_middlewares
 from ...subagents.base import BaseSubAgent
 from ...subagents.registry import SubAgentRegistry
 from ...services import HonchoMemoryService
@@ -65,11 +66,13 @@ class HuesaeMainAgent:
         mcp_tools_loader=None,
         skill_registry: SkillRegistry | None = None,
         memory_service: HonchoMemoryService | None = None,
+        middleware_pipeline: MiddlewarePipeline | None = None,
     ):
         self.llm = llm
         self.character_id = character_id
         self.skill_registry = skill_registry
         self.memory_service = memory_service
+        self._middleware_pipeline = middleware_pipeline or build_middlewares()
         self.subagent_registry = SubAgentRegistry()
         runtime_kwargs = {}
         if mcp_tools_loader is not None:
@@ -156,25 +159,55 @@ class HuesaeMainAgent:
         image_context = self._extract_vision_context(state)
         self._vision_context = image_context
         working_messages = self._build_messages(state, user_input)
+        middleware_state = self._middleware_pipeline.run_before_agent(
+            {
+                "messages": working_messages,
+                "user_input": user_input,
+                "state": state,
+                "vision_context": image_context,
+            }
+        )
+        working_messages = middleware_state.get("messages", working_messages)
         tool_results: list[str] = []
 
         for step in range(self.MAX_STEPS):
             try:
+                middleware_state.update(
+                    {
+                        "messages": working_messages,
+                        "step": step,
+                        "tools": self.tools,
+                        "state": state,
+                        "vision_context": image_context,
+                    }
+                )
+                middleware_state = self._middleware_pipeline.run_before_model(middleware_state)
+                working_messages = middleware_state.get("messages", working_messages)
                 ai_message = self._invoke_with_tools(working_messages)
+                middleware_state.update(
+                    {
+                        "messages": working_messages + [ai_message],
+                        "model_response": ai_message,
+                        "step": step,
+                    }
+                )
+                middleware_state = self._middleware_pipeline.run_after_model(middleware_state)
             except Exception:
                 # 降级处理：函数调用失败时直接聊天。
-                return {
+                result = {
                     "messages": [AIMessage(content=_FALLBACK_RESPONSE)],
                     "vision_context": image_context,
                 }
+                return self._run_after_agent(middleware_state, result, user_input, state, image_context)
 
             tool_calls = getattr(ai_message, "tool_calls", None) or []
             if not tool_calls:
                 self._vision_context = image_context
-                return {
+                result = {
                     "messages": [AIMessage(content=str(ai_message.content or ""))],
                     "vision_context": image_context,
                 }
+                return self._run_after_agent(middleware_state, result, user_input, state, image_context)
 
             working_messages.append(ai_message)
             for tool_call in tool_calls:
@@ -195,7 +228,14 @@ class HuesaeMainAgent:
                 task = parse_subagent_task(result) if isinstance(result, str) else None
                 if task is not None:
                     subagent_type, description = task
-                    return self._start_subagent(state, subagent_type, description)
+                    subagent_result = self._start_subagent(state, subagent_type, description)
+                    return self._run_after_agent(
+                        middleware_state,
+                        subagent_result,
+                        user_input,
+                        state,
+                        image_context,
+                    )
 
                 result_text = str(result)
                 tool_results.append(result_text)
@@ -206,13 +246,37 @@ class HuesaeMainAgent:
             self._vision_context = image_context
 
         if tool_results:
-            return {
+            result = {
                 "messages": [AIMessage(content=self._format_last_tool_result(tool_results[-1]))],
                 "vision_context": image_context,
             }
+            return self._run_after_agent(middleware_state, result, user_input, state, image_context)
 
         # 超过最大步数且没有工具结果时，降级到直接聊天。
-        return {"messages": [AIMessage(content=_FALLBACK_RESPONSE)], "vision_context": image_context}
+        result = {"messages": [AIMessage(content=_FALLBACK_RESPONSE)], "vision_context": image_context}
+        return self._run_after_agent(middleware_state, result, user_input, state, image_context)
+
+    def _run_after_agent(
+        self,
+        middleware_state: dict,
+        result: dict,
+        user_input: str,
+        state: dict,
+        vision_context: dict,
+    ) -> dict:
+        """执行 Agent 结束钩子；当前返回结果不由中间件改写。"""
+        hook_state = dict(middleware_state or {})
+        hook_state.update(
+            {
+                "messages": result.get("messages", []),
+                "result": result,
+                "user_input": user_input,
+                "state": state,
+                "vision_context": vision_context,
+            }
+        )
+        self._middleware_pipeline.run_after_agent(hook_state)
+        return result
 
     # ============== 系统提示词构建 ==============
 
@@ -606,6 +670,7 @@ def create_main_agent(
     mcp_tools_loader=None,
     skill_registry: SkillRegistry | None = None,
     memory_service: HonchoMemoryService | None = None,
+    middleware_pipeline: MiddlewarePipeline | None = None,
 ) -> HuesaeMainAgent:
     """创建主Agent工厂函数
 
@@ -629,4 +694,5 @@ def create_main_agent(
         mcp_tools_loader=mcp_tools_loader,
         skill_registry=skill_registry,
         memory_service=memory_service,
+        middleware_pipeline=middleware_pipeline,
     )

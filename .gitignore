@@ -56,6 +56,7 @@ web/
 
 # Markdown documents
 *.md
+!CLAUDE.md
 
 # Local Honcho/session state
 .state/
