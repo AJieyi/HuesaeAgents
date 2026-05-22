@@ -1,4 +1,4 @@
-# 多Agent的AIGC系统
+# AIGC多智能体系统
 
 个人开发中ing
 
