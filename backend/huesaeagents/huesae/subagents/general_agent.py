@@ -6,15 +6,17 @@
 
 from __future__ import annotations
 
-from typing import Any
-
+from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
-from langchain.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain.messages import AIMessage, HumanMessage, SystemMessage
+from langgraph.checkpoint.memory import InMemorySaver
 
+from ..agents.model_adapter import ensure_chat_model
+from ..agents.thread_state import HuesaeThreadState
 from ..skills.registry import SkillRegistry
 from ..tools.runtime import GENERAL_AGENT_EXCLUDED_TOOL_NAMES, build_shared_runtime
-from ..tools.tools import LOAD_MCP_TOOLS_SIGNAL, is_load_mcp_tools_signal
+from ..agents.middlewares import RuntimeToolMiddleware
 from .base import BaseSubAgent
 
 
@@ -62,6 +64,7 @@ class GeneralSubAgent(BaseSubAgent):
         skill_registry: SkillRegistry | None = None,
     ):
         self.llm = llm
+        self._agent_model = ensure_chat_model(llm)
         self.skill_registry = skill_registry
         self.runtime = runtime or build_shared_runtime(
             llm,
@@ -70,6 +73,8 @@ class GeneralSubAgent(BaseSubAgent):
         )
         self.tools: list[BaseTool] = []
         self.tool_map: dict[str, BaseTool] = {}
+        self._checkpointer = InMemorySaver()
+        self.agent = None
         self._refresh_tools()
 
     def _refresh_tools(self) -> None:
@@ -85,57 +90,54 @@ class GeneralSubAgent(BaseSubAgent):
             include_task_tool=False,
             exclude_names=GENERAL_AGENT_EXCLUDED_TOOL_NAMES,
         )
+        self._rebuild_agent()
 
     def _refresh_tools_with_mcp(self) -> None:
         """加载 MCP 工具后刷新通用子Agent工具视图。"""
         self.runtime.refresh_mcp_tools(force=False)
         self._refresh_tools()
 
+    def _rebuild_agent(self) -> None:
+        """Compile the LangChain graph-backed general agent."""
+        self.agent = create_agent(
+            model=self._agent_model,
+            tools=self.tools,
+            system_prompt=self._build_system_prompt(),
+            middleware=[
+                RuntimeToolMiddleware(
+                    tools=lambda: self.tools,
+                    tool_map=lambda: self.tool_map,
+                    system_message=self._build_system_prompt,
+                    ensure_mcp_tools=self._refresh_tools_with_mcp,
+                    is_mcp_loaded=lambda: self.runtime.mcp_loaded,
+                    has_mcp_tools=lambda: bool(self.runtime._mcp_tools),
+                )
+            ],
+            state_schema=HuesaeThreadState,
+            checkpointer=self._checkpointer,
+            name="huesae_general_agent",
+        )
+
     def process(self, state: dict, user_input: str) -> dict:
         """执行主Agent委派的通用任务。"""
         self._refresh_tools()
-        working_messages = self._build_messages(state, user_input)
-        tool_results: list[str] = []
+        try:
+            graph_state = self.agent.invoke(
+                {"messages": [HumanMessage(content=user_input)], "user_input": user_input},
+                config={"configurable": {"thread_id": str(state.get("thread_id") or f"general-{id(state)}")}},
+            )
+        except Exception as exc:
+            return self._make_result("error", f"通用任务执行失败：{exc}")
 
-        for step in range(self.MAX_STEPS):
-            try:
-                ai_message = self._invoke_with_tools(working_messages)
-            except Exception as exc:
-                return self._make_result(
-                    "error",
-                    f"通用任务执行失败：{exc}",
-                )
-
-            tool_calls = getattr(ai_message, "tool_calls", None) or []
-            if not tool_calls:
-                content = str(ai_message.content or "").strip()
-                if not content and tool_results:
-                    content = tool_results[-1]
-                if not content:
-                    content = "任务已完成。"
-                return self._make_result("finish", content)
-
-            working_messages.append(ai_message)
-            for tool_call in tool_calls:
-                tool_name = tool_call.get("name") or ""
-                tool_args = tool_call.get("args") or {}
-                tool_call_id = tool_call.get("id") or tool_name
-                result = self._execute_tool(tool_name, tool_args)
-
-                if is_load_mcp_tools_signal(result):
-                    if not self.runtime.mcp_loaded:
-                        self._refresh_tools_with_mcp()
-                    working_messages[0] = self._build_system_prompt(user_input)
-                    result = "MCP 扩展工具已加载，请继续根据任务选择最合适的工具。"
-
-                result_text = str(result)
-                tool_results.append(result_text)
-                working_messages.append(ToolMessage(content=result_text, tool_call_id=tool_call_id))
-
-            working_messages[0] = self._build_system_prompt(user_input)
-
-        summary = self._summarize_completion(working_messages, tool_results, user_input)
-        return self._make_result("finish", summary)
+        messages = graph_state.get("messages") or []
+        new_messages = self._new_messages_for_turn(messages, user_input)
+        latest_tool_result = self._latest_tool_content(new_messages)
+        content = self._last_ai_content(new_messages) or self._last_ai_content(messages)
+        if not content and latest_tool_result:
+            content = latest_tool_result
+        if not content:
+            content = "任务已完成。"
+        return self._make_result("finish", content)
 
     def _build_system_prompt(self, user_input: str | None = None) -> SystemMessage:
         """构建通用任务执行提示词。"""
@@ -174,50 +176,29 @@ class GeneralSubAgent(BaseSubAgent):
         messages.append(HumanMessage(content=user_input))
         return messages
 
-    def _invoke_with_tools(self, messages: list) -> AIMessage:
-        """使用当前可见工具执行模型调用。"""
-        bound_llm = self.llm.bind_tools(self.tools)
-        response = bound_llm.invoke(messages)
-        if isinstance(response, AIMessage):
-            return response
-        return AIMessage(content=str(getattr(response, "content", response)))
+    @staticmethod
+    def _new_messages_for_turn(messages: list, user_input: str) -> list:
+        start_index = 0
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if getattr(message, "type", None) == "human" and str(message.content) == user_input:
+                start_index = index + 1
+                break
+        return messages[start_index:]
 
-    def _execute_tool(self, tool_name: str, tool_args: dict) -> str:
-        """执行通用任务中的指定工具。"""
-        if tool_name not in self.tool_map:
-            if not self.runtime.mcp_loaded:
-                self._refresh_tools_with_mcp()
-                return LOAD_MCP_TOOLS_SIGNAL
-            return f"错误：未知工具 {tool_name}。可用工具：{list(self.tool_map.keys())}"
+    @staticmethod
+    def _latest_tool_content(messages: list) -> str | None:
+        for message in reversed(messages):
+            if getattr(message, "type", None) == "tool":
+                return str(message.content)
+        return None
 
-        tool = self.tool_map[tool_name]
-        try:
-            return str(tool.invoke(tool_args))
-        except Exception as exc:
-            return f"工具执行失败：{exc}"
-
-    def _summarize_completion(self, messages: list, tool_results: list[str], user_input: str) -> str:
-        """在步数耗尽时，让 LLM 汇总已完成的工作。"""
-        summary_prompt = (
-            "你已经执行了一个复杂任务，请总结你已经完成的工作，"
-            "输出简洁清晰的最终结果，不要再提问，不要扩展到无关内容。"
-        )
-        summary_messages = [
-            self._build_system_prompt(user_input),
-            *messages[-8:],
-            HumanMessage(content=summary_prompt),
-        ]
-        try:
-            response = self.llm.invoke(summary_messages)
-            content = str(getattr(response, "content", response) or "").strip()
-            if content:
-                return content
-        except Exception:
-            pass
-
-        if tool_results:
-            return tool_results[-1]
-        return "任务已完成。"
+    @staticmethod
+    def _last_ai_content(messages: list) -> str:
+        for message in reversed(messages):
+            if isinstance(message, AIMessage):
+                return str(message.content or "").strip()
+        return ""
 
     @staticmethod
     def _make_result(action: str, response: str) -> dict:

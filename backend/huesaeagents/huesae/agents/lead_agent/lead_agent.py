@@ -1,28 +1,18 @@
-"""主Agent（Lead Agent）- DeerFlow Harness Engineering 模式
-
-对话核心，采用 ReAct 循环让 LLM 自主决策：
-- 直接回复用户
-- 调用工具（生图、扩写、标签转换等）
-- 委托子Agent处理复杂多轮对话
-
-核心设计原则：
-1. 工具选择完全由 LLM 决定，系统只提供工具列表和描述
-2. 新增子Agent = 新增工具，无需修改分类逻辑
-3. 保留子Agent的多轮对话能力（通过 task_tool 委托）
-"""
+"""主Agent（Lead Agent）- DeerFlow Harness Engineering 模式。"""
+from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
-from langchain.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain.messages import HumanMessage, AIMessage, SystemMessage
+from langgraph.checkpoint.memory import InMemorySaver
 
-from ..middlewares import MiddlewarePipeline, build_middlewares
+from ..middlewares import MiddlewarePipeline, RuntimeToolMiddleware, adapt_middlewares, build_middlewares
+from ..model_adapter import ensure_chat_model
+from ..thread_state import HuesaeThreadState
 from ...subagents.base import BaseSubAgent
-from ...subagents.general_agent import GeneralSubAgent
 from ...subagents.registry import SubAgentRegistry
 from ...services import HonchoMemoryService
 from ...skills.registry import SkillRegistry
 from ...tools.runtime import MAIN_AGENT_EXCLUDED_TOOL_NAMES, build_shared_runtime
 from ...tools.tools import (
-    LOAD_MCP_TOOLS_SIGNAL,
-    is_load_mcp_tools_signal,
     parse_subagent_task,
 )
 
@@ -70,11 +60,15 @@ class HuesaeMainAgent:
         middleware_pipeline: MiddlewarePipeline | None = None,
     ):
         self.llm = llm
+        self._agent_model = ensure_chat_model(llm)
         self.character_id = character_id
         self.skill_registry = skill_registry
         self.memory_service = memory_service
         self._middleware_pipeline = middleware_pipeline or build_middlewares()
         self.subagent_registry = SubAgentRegistry()
+        self._checkpointer = InMemorySaver()
+        self._transient_thread_index = 0
+        self.agent = None
         runtime_kwargs = {}
         if mcp_tools_loader is not None:
             runtime_kwargs["mcp_tools_loader"] = mcp_tools_loader
@@ -104,6 +98,7 @@ class HuesaeMainAgent:
             include_task_tool=True,
             exclude_names=MAIN_AGENT_EXCLUDED_TOOL_NAMES,
         )
+        self._rebuild_agent()
 
     def _refresh_tools_with_mcp(self) -> None:
         """懒加载 MCP 工具后刷新完整工具视图。"""
@@ -119,6 +114,29 @@ class HuesaeMainAgent:
             include_mcp=True,
             include_task_tool=True,
             exclude_names=MAIN_AGENT_EXCLUDED_TOOL_NAMES,
+        )
+        self._rebuild_agent()
+
+    def _rebuild_agent(self) -> None:
+        """Compile the LangChain agent backed by LangGraph."""
+        self.agent = create_agent(
+            model=self._agent_model,
+            tools=self.tools,
+            system_prompt=self._build_system_prompt(),
+            middleware=[
+                RuntimeToolMiddleware(
+                    tools=lambda: self.tools,
+                    tool_map=lambda: self.tool_map,
+                    system_message=self._build_system_prompt,
+                    ensure_mcp_tools=self._refresh_tools_with_mcp,
+                    is_mcp_loaded=lambda: self._runtime.mcp_loaded,
+                    has_mcp_tools=lambda: bool(self._runtime._mcp_tools),
+                ),
+                *adapt_middlewares(self._middleware_pipeline.middlewares),
+            ],
+            state_schema=HuesaeThreadState,
+            checkpointer=self._checkpointer,
+            name="huesae_main_agent",
         )
 
     def register_sub_agent(self, agent: BaseSubAgent) -> None:
@@ -158,128 +176,25 @@ class HuesaeMainAgent:
         if state.get("active_subagent"):
             return self._handle_subagent(state, user_input)
 
-        # 3. LangChain 原生函数调用循环
+        # 3. DeerFlow 风格 create_agent 全局运行时
         image_context = self._extract_vision_context(state)
         self._vision_context = image_context
-        working_messages = self._build_messages(state, user_input)
-        middleware_state = self._middleware_pipeline.run_before_agent(
-            {
-                "messages": working_messages,
-                "user_input": user_input,
-                "state": state,
+        config = self._graph_config(state)
+        graph_input = {
+            "messages": self._graph_messages_for_input(state, user_input, config),
+            "user_input": user_input,
+            "vision_context": image_context,
+        }
+
+        try:
+            graph_state = self.agent.invoke(graph_input, config=config)
+        except Exception:
+            return {
+                "messages": [AIMessage(content=_FALLBACK_RESPONSE)],
                 "vision_context": image_context,
             }
-        )
-        working_messages = middleware_state.get("messages", working_messages)
-        tool_results: list[str] = []
 
-        for step in range(self.MAX_STEPS):
-            try:
-                middleware_state.update(
-                    {
-                        "messages": working_messages,
-                        "step": step,
-                        "tools": self.tools,
-                        "state": state,
-                        "vision_context": image_context,
-                    }
-                )
-                middleware_state = self._middleware_pipeline.run_before_model(middleware_state)
-                working_messages = middleware_state.get("messages", working_messages)
-                ai_message = self._invoke_with_tools(working_messages)
-                middleware_state.update(
-                    {
-                        "messages": working_messages + [ai_message],
-                        "model_response": ai_message,
-                        "step": step,
-                    }
-                )
-                middleware_state = self._middleware_pipeline.run_after_model(middleware_state)
-            except Exception:
-                # 降级处理：函数调用失败时直接聊天。
-                result = {
-                    "messages": [AIMessage(content=_FALLBACK_RESPONSE)],
-                    "vision_context": image_context,
-                }
-                return self._run_after_agent(middleware_state, result, user_input, state, image_context)
-
-            tool_calls = getattr(ai_message, "tool_calls", None) or []
-            if not tool_calls:
-                self._vision_context = image_context
-                result = {
-                    "messages": [AIMessage(content=str(ai_message.content or ""))],
-                    "vision_context": image_context,
-                }
-                return self._run_after_agent(middleware_state, result, user_input, state, image_context)
-
-            working_messages.append(ai_message)
-            for tool_call in tool_calls:
-                tool_name = tool_call.get("name") or ""
-                tool_args = tool_call.get("args") or {}
-                tool_call_id = tool_call.get("id") or tool_name
-                result = self._execute_tool(tool_name, tool_args)
-
-                if is_load_mcp_tools_signal(result):
-                    if not self._runtime.mcp_loaded:
-                        self._refresh_tools_with_mcp()
-                    working_messages[0] = self._build_system_prompt(user_input)
-                    result = (
-                        "MCP扩展工具已加载。请结合用户原始需求，根据更新后的工具列表重新选择最合适的具体工具，"
-                        "并严格使用工具 schema 中的参数名。"
-                    )
-
-                task = parse_subagent_task(result) if isinstance(result, str) else None
-                if task is not None:
-                    subagent_type, description = task
-                    subagent_result = self._start_subagent(state, subagent_type, description)
-                    return self._run_after_agent(
-                        middleware_state,
-                        subagent_result,
-                        user_input,
-                        state,
-                        image_context,
-                    )
-
-                result_text = str(result)
-                tool_results.append(result_text)
-                working_messages.append(ToolMessage(content=result_text, tool_call_id=tool_call_id))
-                image_context = self._update_vision_context(image_context, tool_name, tool_args, result_text)
-
-            working_messages[0] = self._build_system_prompt(user_input)
-            self._vision_context = image_context
-
-        if tool_results:
-            result = {
-                "messages": [AIMessage(content=self._format_last_tool_result(tool_results[-1]))],
-                "vision_context": image_context,
-            }
-            return self._run_after_agent(middleware_state, result, user_input, state, image_context)
-
-        # 超过最大步数且没有工具结果时，降级到直接聊天。
-        result = {"messages": [AIMessage(content=_FALLBACK_RESPONSE)], "vision_context": image_context}
-        return self._run_after_agent(middleware_state, result, user_input, state, image_context)
-
-    def _run_after_agent(
-        self,
-        middleware_state: dict,
-        result: dict,
-        user_input: str,
-        state: dict,
-        vision_context: dict,
-    ) -> dict:
-        """执行 Agent 结束钩子；当前返回结果不由中间件改写。"""
-        hook_state = dict(middleware_state or {})
-        hook_state.update(
-            {
-                "messages": result.get("messages", []),
-                "result": result,
-                "user_input": user_input,
-                "state": state,
-                "vision_context": vision_context,
-            }
-        )
-        self._middleware_pipeline.run_after_agent(hook_state)
-        return result
+        return self._format_graph_result(graph_state, state, user_input, image_context)
 
     # ============== 系统提示词构建 ==============
 
@@ -329,6 +244,174 @@ class HuesaeMainAgent:
         messages.append(HumanMessage(content=user_input))
         return messages
 
+    def _graph_config(self, state: dict) -> dict:
+        """Build LangGraph runnable config with thread isolation."""
+        thread_id = state.get("thread_id")
+        if thread_id:
+            return {"configurable": {"thread_id": str(thread_id)}}
+
+        default_config = {"configurable": {"thread_id": "default"}}
+        if self._can_use_default_thread(state, default_config):
+            return default_config
+        return {"configurable": {"thread_id": self._next_transient_thread_id()}}
+
+    def _next_transient_thread_id(self) -> str:
+        self._transient_thread_index += 1
+        return f"turn-{self._transient_thread_index}"
+
+    def _can_use_default_thread(self, state: dict, config: dict) -> bool:
+        """Keep the default thread for a matching legacy conversation only."""
+        checkpoint_messages = self._checkpoint_messages(config)
+        if not checkpoint_messages:
+            return True
+        history = list(state.get("messages", [])[-10:])
+        if not history:
+            return False
+        return self._legacy_history_matches_checkpoint(history, checkpoint_messages)
+
+    def _graph_messages_for_input(self, state: dict, user_input: str, config: dict) -> list:
+        """Seed the graph from legacy history only when the checkpoint is empty."""
+        checkpoint_messages = self._checkpoint_messages(config)
+        history = list(state.get("messages", [])[-10:])
+        if checkpoint_messages:
+            return self._missing_legacy_messages(history, checkpoint_messages) + [HumanMessage(content=user_input)]
+        return history + [HumanMessage(content=user_input)]
+
+    def _checkpoint_messages(self, config: dict) -> list:
+        """Read checkpoint messages without depending on saver internals."""
+        try:
+            snapshot = self.agent.get_state(config)
+        except Exception:
+            return []
+        values = getattr(snapshot, "values", {}) or {}
+        return values.get("messages") or []
+
+    @staticmethod
+    def _legacy_history_matches_checkpoint(history: list, checkpoint_messages: list) -> bool:
+        history_signatures = HuesaeMainAgent._visible_message_signatures(history)
+        checkpoint_signatures = HuesaeMainAgent._visible_message_signatures(checkpoint_messages)
+        if not history_signatures:
+            return False
+        count = len(history_signatures)
+        return checkpoint_signatures[-count:] == history_signatures
+
+    @staticmethod
+    def _missing_legacy_messages(history: list, checkpoint_messages: list) -> list:
+        """Return visible legacy messages that are not already checkpointed."""
+        checkpoint_visible = HuesaeMainAgent._visible_message_signatures(checkpoint_messages)
+        history_signatures = HuesaeMainAgent._visible_message_signatures(history)
+        if not history_signatures:
+            return []
+
+        matched_count = 0
+        max_count = min(len(history_signatures), len(checkpoint_visible))
+        for count in range(max_count, 0, -1):
+            if history_signatures[:count] == checkpoint_visible[-count:]:
+                matched_count = count
+                break
+            for start in range(0, len(checkpoint_visible) - count + 1):
+                if history_signatures[:count] == checkpoint_visible[start : start + count]:
+                    matched_count = count
+                    break
+            if matched_count:
+                break
+        return history[matched_count:]
+
+    @staticmethod
+    def _visible_message_signatures(messages: list) -> list[tuple[str, str]]:
+        return [
+            HuesaeMainAgent._message_signature(message)
+            for message in messages
+            if getattr(message, "type", None) in ("human", "ai")
+            and str(getattr(message, "content", "") or "").strip()
+        ]
+
+    @staticmethod
+    def _message_signature(message) -> tuple[str, str]:
+        return getattr(message, "type", ""), str(getattr(message, "content", ""))
+
+    def _format_graph_result(
+        self,
+        graph_state: dict,
+        outer_state: dict,
+        user_input: str,
+        image_context: dict,
+    ) -> dict:
+        """Translate create_agent state back to the legacy process() contract."""
+        messages = graph_state.get("messages") or []
+        new_messages = self._new_messages_for_turn(messages, user_input)
+        latest_tool_result = self._latest_tool_content(new_messages)
+
+        task = self._subagent_task_from_messages(new_messages)
+        if task is not None:
+            subagent_type, description = task
+            return self._start_subagent(outer_state, subagent_type, description)
+
+        image_context = self._vision_context_from_messages(image_context, new_messages)
+        self._vision_context = image_context
+        ai_message = self._last_ai_message(new_messages) or self._last_ai_message(messages)
+        content = str(getattr(ai_message, "content", "") or "") if ai_message is not None else ""
+        if not content and latest_tool_result:
+            content = self._format_last_tool_result(latest_tool_result)
+        if not content:
+            content = _FALLBACK_RESPONSE
+        return {
+            "messages": [AIMessage(content=content)],
+            "vision_context": image_context,
+        }
+
+    @staticmethod
+    def _new_messages_for_turn(messages: list, user_input: str) -> list:
+        """Return messages appended by the current create_agent invocation."""
+        start_index = 0
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if getattr(message, "type", None) == "human" and str(message.content) == user_input:
+                start_index = index + 1
+                break
+        return messages[start_index:]
+
+    @staticmethod
+    def _last_ai_message(messages: list) -> AIMessage | None:
+        for message in reversed(messages):
+            if isinstance(message, AIMessage):
+                return message
+        return None
+
+    @staticmethod
+    def _latest_tool_content(messages: list) -> str | None:
+        for message in reversed(messages):
+            if getattr(message, "type", None) == "tool":
+                return str(message.content)
+        return None
+
+    @staticmethod
+    def _subagent_task_from_messages(messages: list) -> tuple[str, str] | None:
+        for message in reversed(messages):
+            if getattr(message, "type", None) == "tool" or isinstance(message, AIMessage):
+                task = parse_subagent_task(str(getattr(message, "content", "") or ""))
+                if task is not None:
+                    return task
+        return None
+
+    def _vision_context_from_messages(self, image_context: dict, messages: list) -> dict:
+        updated = dict(image_context or {})
+        ai_tool_calls: dict[str, dict] = {}
+        for message in messages:
+            if isinstance(message, AIMessage):
+                for tool_call in getattr(message, "tool_calls", None) or []:
+                    call_id = tool_call.get("id") or tool_call.get("name") or ""
+                    ai_tool_calls[call_id] = tool_call
+                continue
+            if getattr(message, "type", None) != "tool":
+                continue
+            tool_call_id = getattr(message, "tool_call_id", "")
+            tool_call = ai_tool_calls.get(tool_call_id) or {}
+            tool_name = tool_call.get("name") or getattr(message, "name", "") or ""
+            tool_args = tool_call.get("args") or {}
+            updated = self._update_vision_context(updated, tool_name, tool_args, str(message.content))
+        return updated
+
     def _get_memory_context(self, user_input: str | None) -> str:
         """Fetch Honcho memory, using the current user input as a retrieval query."""
         if self.memory_service is None:
@@ -337,33 +420,6 @@ class HuesaeMainAgent:
             return self.memory_service.get_context(user_input=user_input)
         except TypeError:
             return self.memory_service.get_context()
-
-    def _invoke_with_tools(self, messages: list) -> AIMessage:
-        """使用 LangChain 原生工具绑定调用模型。"""
-        bound_llm = self.llm.bind_tools(self.tools)
-        response = bound_llm.invoke(messages)
-        if isinstance(response, AIMessage):
-            return response
-        return AIMessage(content=str(getattr(response, "content", response)))
-
-    # ============== 工具执行 ==============
-
-    def _execute_tool(self, tool_name: str, tool_args: dict) -> str:
-        """执行指定工具"""
-        if tool_name not in self.tool_map:
-            if not self._runtime.mcp_loaded:
-                self._refresh_tools_with_mcp()
-                return LOAD_MCP_TOOLS_SIGNAL
-            if tool_name not in self.tool_map:
-                return f"错误：未知工具 {tool_name}。可用工具：{list(self.tool_map.keys())}"
-
-        tool = self.tool_map[tool_name]
-        try:
-            # 调用工具函数
-            result = tool.invoke(tool_args)
-            return str(result)
-        except Exception as e:
-            return f"工具执行失败：{str(e)}"
 
     @staticmethod
     def _format_last_tool_result(result) -> str:
@@ -399,17 +455,16 @@ class HuesaeMainAgent:
         if subagent_type == "general":
             sub_state = {
                 "messages": [],
-                "skill_registry": self.skill_registry,
             }
         else:
             sub_state = {
                 "messages": [],
                 "image_task_type": "generate_image",
                 "image_phase": "collecting_prompt",
-                "skill_registry": self.skill_registry,
             }
         if initial_state:
             sub_state.update(initial_state)
+        sub_state = self._sanitize_subagent_state(sub_state)
 
         # 调用子Agent
         sub_result = agent.process(sub_state, description)
@@ -417,7 +472,6 @@ class HuesaeMainAgent:
         # 构建子Agent上下文
         subagent_context = {
             "agent_type": subagent_type,
-            "agent": agent,
             "state": sub_state,
             "history": [
                 HumanMessage(content=description),
@@ -430,9 +484,11 @@ class HuesaeMainAgent:
 
     def _handle_subagent(self, state: dict, user_input: str) -> dict:
         """继续子Agent的对话"""
-        subagent_context = state.get("active_subagent", {})
-        agent = subagent_context.get("agent")
-        sub_state = subagent_context.get("state", {})
+        subagent_context = dict(state.get("active_subagent", {}))
+        subagent_context.pop("agent", None)
+        agent_type = subagent_context.get("agent_type")
+        agent = self.subagent_registry.get(agent_type)
+        sub_state = self._sanitize_subagent_state(subagent_context.get("state", {}))
         history = subagent_context.get("history", [])
 
         if not agent:
@@ -459,7 +515,18 @@ class HuesaeMainAgent:
         state_update = (sub_result.get("data") or {}).get("state_update") or {}
         if not state_update:
             return
-        subagent_context.setdefault("state", {}).update(state_update)
+        state = subagent_context.setdefault("state", {})
+        state.update(state_update)
+        subagent_context["state"] = HuesaeMainAgent._sanitize_subagent_state(state)
+
+    @staticmethod
+    def _sanitize_subagent_state(state: dict) -> dict:
+        """Keep active_subagent state checkpoint-friendly."""
+        sanitized = dict(state or {})
+        sanitized.pop("agent", None)
+        sanitized.pop("runtime", None)
+        sanitized.pop("skill_registry", None)
+        return sanitized
 
     def _format_subagent_result(self, sub_result: dict, subagent_context: dict) -> dict:
         """把子Agent标准结果转换成主Agent对外返回格式。"""

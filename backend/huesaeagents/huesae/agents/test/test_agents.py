@@ -909,6 +909,8 @@ class TestMainAgentIntegration:
         assert len(result["messages"]) == 1
         assert "请告诉我" in result["messages"][0].content
         assert result["active_subagent"]["agent_type"] == "image"
+        assert "agent" not in result["active_subagent"]
+        assert "skill_registry" not in result["active_subagent"]["state"]
 
     def test_delegate_initial_image_request(self, main_agent):
         """用户说要生图时，应委派生图Agent并追问画面描述。"""
@@ -1006,6 +1008,35 @@ class TestMainAgentIntegration:
         assert calls == []
         assert agent._runtime.mcp_loaded is False
         assert "load_mcp_tools_tool" in agent.tool_map
+
+    def test_create_main_agent_keeps_legacy_process_interface(self, llm):
+        """create_main_agent 返回对象仍支持 process 接口。"""
+        from huesaeagents.huesae.agents.lead_agent import create_main_agent
+
+        agent = create_main_agent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: [])
+        result = agent.process({"messages": []}, "你好")
+
+        assert isinstance(result["messages"][0], AIMessage)
+        assert "你好呀" in result["messages"][0].content
+
+    def test_graph_checkpointer_restores_same_thread(self, llm):
+        """同一 thread_id 下 LangGraph checkpointer 应保留对话状态。"""
+        agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: [])
+        state = {"messages": [], "thread_id": "thread-a"}
+
+        agent.process(state, "你好")
+        snapshot = agent.agent.get_state(agent._graph_config(state))
+
+        assert any(getattr(message, "type", None) == "human" for message in snapshot.values["messages"])
+
+    def test_graph_checkpointer_isolates_threads(self, llm):
+        """不同 thread_id 的 LangGraph 状态应相互隔离。"""
+        agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: [])
+
+        agent.process({"messages": [], "thread_id": "thread-a"}, "你好")
+        snapshot_b = agent.agent.get_state(agent._graph_config({"thread_id": "thread-b"}))
+
+        assert not snapshot_b.values
 
     def test_main_agent_loads_mcp_only_when_tool_requests_it(self, llm):
         """只有调用 MCP 加载工具时，才初始化 MCP 工具缓存。"""
@@ -1253,6 +1284,13 @@ class TestGeneralSubAgent:
 
         assert result["action"] == "finish"
         assert "通用任务结果" in result["response"]
+
+    def test_general_agent_tool_view_has_no_task_tool(self, llm):
+        """通用子Agent不可调用 task_tool。"""
+        runtime = build_shared_runtime(llm, skill_registry=SkillRegistry())
+        general_agent = GeneralSubAgent(llm=llm, runtime=runtime, skill_registry=SkillRegistry())
+
+        assert "task_tool" not in {tool.name for tool in general_agent.tools}
 
 
 class TestAgentMiddlewares:
