@@ -496,15 +496,18 @@ class HuesaeMainAgent:
 
         # 更新子Agent状态
         sub_state["messages"] = history
+        subagent_context["state"] = sub_state
 
         # 调用子Agent
         sub_result = agent.process(sub_state, user_input)
         self._apply_subagent_state_update(subagent_context, sub_result)
+        sub_state = subagent_context.get("state", sub_state)
 
         # 更新历史
         history.append(HumanMessage(content=user_input))
         history.append(AIMessage(content=sub_result.get("response", "")))
         subagent_context["history"] = history
+        sub_state["messages"] = history
         subagent_context["state"] = sub_state
 
         return self._format_subagent_result(sub_result, subagent_context)

@@ -7,7 +7,10 @@
 
 本文件使用本地假模型，不访问真实 LLM 或生图 API。
 """
+import logging
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -929,6 +932,23 @@ class TestMainAgentIntegration:
         assert result["active_subagent"]["state"]["image_phase"] == "awaiting_prompt_confirm"
         assert "如果这个描述可以" in result["messages"][0].content
 
+    def test_confirm_prompt_after_delegation_starts_generation(self, main_agent):
+        """提示词确认后，用户回复可以应进入生图，而不是重复确认。"""
+        delegated = main_agent.process({"messages": []}, "画一只猫")
+
+        result = main_agent.process(
+            {
+                "messages": [],
+                "active_subagent": delegated["active_subagent"],
+            },
+            "可以",
+        )
+
+        assert result.get("pending_generation") is True
+        assert result["active_subagent"]["state"]["image_phase"] == "awaiting_generation"
+        assert result["prompt"] == "画一只猫"
+        assert "如果这个描述可以" not in result["messages"][0].content
+
     def test_chat_after_image_generation(self, main_agent):
         """没有 active_subagent 时，普通反馈不应再次进入生图流程。"""
         messages = [
@@ -1396,6 +1416,33 @@ class TestAgentMiddlewares:
 
         assert "你好呀" in result["messages"][0].content
         assert calls == ["before_agent", "before_model", "after_model", "after_agent"]
+
+
+class TestChatLoopConsoleOutput:
+    """测试终端输出不会把日志插入 AI 流式回复中。"""
+
+    def test_logs_wait_until_streamed_ai_line_finishes(self, capsys):
+        from huesaeagents.huesae.agents.lead_agent import chat_loop
+
+        logger = logging.getLogger("huesaeagents.test.chat_loop_output")
+        handler = chat_loop._ConsoleLogHandler(stream=sys.stdout)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.handlers = [handler]
+        logger.propagate = False
+        logger.setLevel(logging.INFO)
+
+        worker = threading.Thread(
+            target=lambda: chat_loop.print_stream("主人好", delay=0.01),
+        )
+        worker.start()
+        time.sleep(0.015)
+        logger.info('HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 400 Bad Request"')
+        worker.join()
+
+        output = capsys.readouterr().out
+        ai_line, log_line = output.splitlines()
+        assert ai_line == "AI: 主人好"
+        assert "HTTP Request: POST https://api.deepseek.com/chat/completions" in log_line
 
 
 class TestDanbooruTags:

@@ -26,6 +26,8 @@ if __package__ is None:
 import asyncio
 import logging
 import os
+import sys
+import threading
 import time
 import warnings
 
@@ -39,6 +41,18 @@ warnings.filterwarnings(
 from langchain.messages import HumanMessage, AIMessage
 
 
+_CONSOLE_OUTPUT_LOCK = threading.RLock()
+
+
+class _ConsoleLogHandler(logging.StreamHandler):
+    """Write logs through the same lock used by streaming terminal output."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        with _CONSOLE_OUTPUT_LOCK:
+            super().emit(record)
+            self.flush()
+
+
 def configure_chat_loop_logging() -> None:
     """配置终端日志，让 TokenUsageMiddleware 的 token 用量能在 chat_loop 中显示。"""
     show_token_usage_logs = os.getenv("HUESAE_SHOW_TOKEN_USAGE_LOGS", "1").lower() not in {
@@ -47,9 +61,12 @@ def configure_chat_loop_logging() -> None:
         "no",
         "off",
     }
+    handler = _ConsoleLogHandler(stream=sys.stdout)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logging.basicConfig(
         level=logging.INFO if show_token_usage_logs else logging.WARNING,
-        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[handler],
+        force=True,
     )
 
 
@@ -61,11 +78,12 @@ def print_stream(text: str, prefix: str = "AI: ", delay: float = 0.025) -> None:
         prefix: 前缀（如"AI: "）
         delay: 每个字符的延迟（秒）
     """
-    print(prefix, end="", flush=True)
-    for char in text:
-        print(char, end="", flush=True)
-        time.sleep(delay)
-    print()
+    with _CONSOLE_OUTPUT_LOCK:
+        print(prefix, end="", flush=True)
+        for char in text:
+            print(char, end="", flush=True)
+            time.sleep(delay)
+        print()
 
 
 def run_chat_loop():
