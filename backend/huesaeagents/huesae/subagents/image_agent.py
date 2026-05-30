@@ -5,11 +5,13 @@
 
 支持流程：追问 → 推荐 → 扩写 → 确认描述 → 生图 → 确认图片 → 结束
 """
+import asyncio
 from typing import Literal, TypedDict
 
 from pydantic import BaseModel, Field
 from langchain_core.language_models import BaseChatModel
-from langchain.messages import HumanMessage
+from langchain.messages import AIMessage, HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from .base import BaseSubAgent
@@ -92,8 +94,8 @@ class ImageWorkflowState(TypedDict, total=False):
 
     state: dict
     user_input: str
-    decision: ImageDecision
-    user_intent: ImageUserIntent
+    decision: dict
+    user_intent: dict
     result: dict
 
 
@@ -132,6 +134,8 @@ class ImageSubAgent(BaseSubAgent):
             for p in providers:
                 self.register_provider(p)
         self.default_provider = default_provider
+        self._checkpointer = InMemorySaver()
+        self._transient_thread_index = 0
         self.workflow = self._build_workflow()
 
     def register_provider(self, provider: ImageProvider) -> None:
@@ -140,21 +144,118 @@ class ImageSubAgent(BaseSubAgent):
 
     # ============== 主入口：标准化接口 ==============
 
-    def process(self, state: dict, user_input: str) -> dict:
-        """处理用户输入，返回标准化结果
+    def invoke(self, user_input: str, *, thread_id: str, state: dict | None = None) -> dict:
+        """Run the image graph with an isolated subagent thread state."""
+        return self._run_workflow(
+            dict(state or {}),
+            user_input,
+            thread_id=thread_id,
+            execute_generation=True,
+        )
 
-        Args:
-            state: 当前状态（包含 messages 对话历史）
-            user_input: 用户最新输入
-
-        Returns:
-            dict: 标准化结果 {action, response, prompt, provider, data}
-        """
+    def _run_workflow(
+        self,
+        state: dict,
+        user_input: str,
+        *,
+        execute_generation: bool,
+        thread_id: str | None = None,
+    ) -> dict:
+        config = self._graph_config(thread_id)
+        sub_state = self._merge_checkpoint_state(config, state)
         workflow_state = self.workflow.invoke({
-            "state": state,
+            "state": sub_state,
             "user_input": user_input,
-        })
-        return workflow_state["result"]
+        }, config=config)
+        result = workflow_state["result"]
+        if execute_generation and result.get("action") == "generate":
+            result = asyncio.run(self._execute_generation_result(result))
+        self._persist_conversation_state(config, sub_state, user_input, result)
+        return result
+
+    def _graph_config(self, thread_id: str | None) -> dict:
+        if not thread_id:
+            self._transient_thread_index += 1
+            thread_id = f"image-transient-{self._transient_thread_index}"
+        return {"configurable": {"thread_id": str(thread_id)}}
+
+    def _merge_checkpoint_state(self, config: dict, state: dict) -> dict:
+        checkpoint_state = self.get_state(config["configurable"]["thread_id"])
+        merged = dict(checkpoint_state)
+        merged.update(state or {})
+        return merged
+
+    def get_state(self, thread_id: str) -> dict:
+        """Return the image workflow's local persisted state."""
+        try:
+            snapshot = self.workflow.get_state({"configurable": {"thread_id": str(thread_id)}})
+        except Exception:
+            return {}
+        values = getattr(snapshot, "values", {}) or {}
+        return dict(values.get("state") or {})
+
+    def _persist_conversation_state(self, config: dict, state: dict, user_input: str, result: dict) -> None:
+        updated = dict(state or {})
+        updated.update((result.get("data") or {}).get("state_update") or {})
+        history = list(updated.get("messages") or [])
+        history.append(HumanMessage(content=user_input))
+        history.append(AIMessage(content=str(result.get("response") or "")))
+        updated["messages"] = history
+        self.workflow.update_state(config, {"state": updated})
+
+    async def _execute_generation_result(self, result: dict) -> dict:
+        """Execute image provider work inside the image subagent graph boundary."""
+        prompt = result.get("prompt") or ""
+        data = dict(result.get("data") or {})
+        size = data.get("size", "2K")
+        output_format = data.get("output_format", "jpeg")
+        is_batch = data.get("is_batch", False)
+
+        if is_batch:
+            generations = await self.generate_images(
+                prompt=prompt,
+                provider_name=result.get("provider"),
+                size=size,
+                output_format=output_format,
+            )
+            image_urls = [generation.url for generation in generations]
+        else:
+            generation = await self.generate_image(
+                prompt=prompt,
+                provider_name=result.get("provider"),
+                size=size,
+                output_format=output_format,
+            )
+            image_urls = [generation.url]
+
+        data.update(
+            {
+                "image_urls": image_urls,
+                "artifacts": [{"type": "image", "url": url} for url in image_urls],
+                "state_update": {
+                    **(data.get("state_update") or {}),
+                    "image_phase": "awaiting_image_confirm",
+                    "last_image_urls": image_urls,
+                    "last_generation_succeeded": True,
+                },
+            }
+        )
+        response = result.get("response") or "图片已经生成完成啦~"
+        if image_urls:
+            image_lines = "\n".join(f"[图片] {url}" for url in image_urls)
+            confirm = (
+                "这些图片可以吗？如果满意请回复“可以”，也可以说“换一组”或重新输入提示词~"
+                if is_batch
+                else "这张图片可以吗？如果满意请回复“可以”，也可以说“换一张”或重新输入提示词~"
+            )
+            response = f"{response}\n\n{image_lines}\n\n{confirm}"
+
+        return {
+            **result,
+            "action": "show_image",
+            "response": response,
+            "data": data,
+        }
 
     # ============== LangGraph 工作流 ==============
 
@@ -190,25 +291,25 @@ class ImageSubAgent(BaseSubAgent):
         workflow.add_edge("prompt_confirmation", END)
         workflow.add_edge("image_confirmation", END)
         workflow.add_edge("general_decision", END)
-        return workflow.compile()
+        return workflow.compile(checkpointer=self._checkpointer)
 
     def _workflow_decide(self, graph_state: ImageWorkflowState) -> dict:
         """调用 LLM 输出候选决策。"""
         state = graph_state.get("state", {})
         user_input = graph_state.get("user_input", "")
-        return {"decision": self._decide(state, user_input)}
+        return {"decision": self._decide(state, user_input).model_dump()}
 
     def _workflow_classify_user_intent(self, graph_state: ImageWorkflowState) -> dict:
         """使用 LLM 识别用户在确认流程中的语义意图。"""
         state = graph_state.get("state", {})
         user_input = graph_state.get("user_input", "")
-        decision = graph_state["decision"]
-        return {"user_intent": self._classify_user_intent(state, user_input, decision)}
+        decision = self._decision_from_state(graph_state)
+        return {"user_intent": self._classify_user_intent(state, user_input, decision).model_dump()}
 
     def _route_after_intent(self, graph_state: ImageWorkflowState) -> ImageWorkflowRoute:
         """根据 LLM 识别出的语义意图和当前阶段路由。"""
         state = graph_state.get("state", {})
-        user_intent = graph_state["user_intent"]
+        user_intent = self._user_intent_from_state(graph_state)
         phase = state.get("image_phase", "collecting_prompt")
 
         if user_intent.intent == "end":
@@ -233,7 +334,7 @@ class ImageSubAgent(BaseSubAgent):
     def _workflow_clarify_user(self, graph_state: ImageWorkflowState) -> dict:
         """向用户澄清当前确认流程的下一步。"""
         state = graph_state.get("state", {})
-        user_intent = graph_state["user_intent"]
+        user_intent = self._user_intent_from_state(graph_state)
         question = user_intent.clarification_question or self._default_clarification_question(state)
         return {"result": _make_result(
             action="ask_confirm",
@@ -247,8 +348,8 @@ class ImageSubAgent(BaseSubAgent):
         """处理提示词确认阶段。"""
         state = graph_state.get("state", {})
         user_input = graph_state.get("user_input", "")
-        decision = graph_state["decision"]
-        user_intent = graph_state["user_intent"]
+        decision = self._decision_from_state(graph_state)
+        user_intent = self._user_intent_from_state(graph_state)
         return {"result": self._handle_prompt_confirmation_phase(
             state,
             user_input,
@@ -260,8 +361,8 @@ class ImageSubAgent(BaseSubAgent):
         """处理图片确认阶段。"""
         state = graph_state.get("state", {})
         user_input = graph_state.get("user_input", "")
-        decision = graph_state["decision"]
-        user_intent = graph_state["user_intent"]
+        decision = self._decision_from_state(graph_state)
+        user_intent = self._user_intent_from_state(graph_state)
         return {"result": self._handle_image_confirmation_phase(
             state,
             user_input,
@@ -273,8 +374,22 @@ class ImageSubAgent(BaseSubAgent):
         """处理尚未进入确认阶段的普通生图决策。"""
         state = graph_state.get("state", {})
         user_input = graph_state.get("user_input", "")
-        decision = graph_state["decision"]
+        decision = self._decision_from_state(graph_state)
         return {"result": self._result_from_decision(state, user_input, decision)}
+
+    @staticmethod
+    def _decision_from_state(graph_state: ImageWorkflowState) -> ImageDecision:
+        decision = graph_state["decision"]
+        if isinstance(decision, ImageDecision):
+            return decision
+        return ImageDecision.model_validate(decision)
+
+    @staticmethod
+    def _user_intent_from_state(graph_state: ImageWorkflowState) -> ImageUserIntent:
+        user_intent = graph_state["user_intent"]
+        if isinstance(user_intent, ImageUserIntent):
+            return user_intent
+        return ImageUserIntent.model_validate(user_intent)
 
     def _result_from_decision(
         self,

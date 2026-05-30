@@ -1,4 +1,4 @@
-"""Agent 行为测试。
+﻿"""Agent 行为测试。
 
 测试范围：
 1. 主Agent工具注册和子Agent委派
@@ -52,6 +52,7 @@ from huesaeagents.huesae.subagents.image import (
     expand_prompt,
     generate_tags,
 )
+from huesaeagents.huesae.subagents.image.providers.base import GenerationResult, ImageProvider
 from huesaeagents.huesae.tools.runtime import build_shared_runtime
 VIDEO_PATH = "F:/videos/demo.mp4"
 IMAGE_PATH_1 = "F:/images/a.png"
@@ -59,6 +60,24 @@ IMAGE_PATH_2 = "F:/images/b.png"
 IMAGE_PATH_3 = "F:/images/c.png"
 DOUYIN_URL = "https://www.douyin.com/video/1234567890"
 BILIBILI_URL = "https://www.bilibili.com/video/BV1xx411c7mu"
+
+
+def _run_image_workflow(agent, state: dict, user_input: str) -> dict:
+    return agent._run_workflow(state, user_input, execute_generation=False)
+
+
+class _FakeImageProvider(ImageProvider):
+    @property
+    def name(self) -> str:
+        return "doubao"
+
+    async def generate(self, prompt: str, size: str = "2K", **kwargs) -> GenerationResult:
+        return GenerationResult(
+            url="https://example.com/generated.jpeg",
+            provider=self.name,
+            prompt=prompt,
+            size=size,
+        )
 
 
 class FakeStructuredLLM:
@@ -580,7 +599,7 @@ def llm():
 def main_agent(llm):
     """共享的主Agent实例。"""
     agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: [])
-    agent.register_sub_agent(create_image_agent(llm=llm, providers=[]))
+    agent.register_sub_agent(create_image_agent(llm=llm, providers=[_FakeImageProvider()]))
     agent.register_sub_agent(create_general_agent(llm=llm, runtime=agent._runtime))
     return agent
 
@@ -676,7 +695,7 @@ description: Get current weather.
             mcp_tools_loader=lambda *args, **kwargs: [],
             skill_registry=SkillRegistry(tmp_path),
         )
-        result = agent.process({"messages": []}, "北京今天天气怎么样")
+        result = agent.invoke("北京今天天气怎么样")
 
         assert "wttr.in" in result["messages"][0].content
 
@@ -686,14 +705,14 @@ class TestImageSubAgent:
 
     def test_ask_prompt_when_no_description(self, image_agent):
         """用户只说想生成图片时，子Agent应追问具体描述。"""
-        result = image_agent.process({}, "我想生成图片")
+        result = _run_image_workflow(image_agent, {}, "我想生成图片")
 
         assert result["action"] == "ask_prompt"
         assert "请告诉我" in result["response"]
 
     def test_initial_image_request_uses_agent_question_not_generic_clarification(self, image_agent):
         """初始生图请求应使用生图Agent追问，不应被澄清节点覆盖。"""
-        result = image_agent.process({}, "我要生图")
+        result = _run_image_workflow(image_agent, {}, "我要生图")
 
         assert result["action"] == "ask_prompt"
         assert "请告诉我您想要生成什么样的图片" in result["response"]
@@ -706,7 +725,7 @@ class TestImageSubAgent:
                 AIMessage(content="请告诉我您想要生成什么样的图片？"),
             ],
         }
-        result = image_agent.process(state, "夕阳下看大海的少女，穿着水手服")
+        result = _run_image_workflow(image_agent, state, "夕阳下看大海的少女，穿着水手服")
 
         assert result["action"] == "ask_confirm"
         assert "如果这个描述可以" in result["response"]
@@ -714,7 +733,7 @@ class TestImageSubAgent:
 
     def test_recommend_when_asked(self, image_agent):
         """用户要求推荐时，子Agent应返回推荐内容。"""
-        result = image_agent.process({}, "你帮我推荐一些吧")
+        result = _run_image_workflow(image_agent, {}, "你帮我推荐一些吧")
 
         assert result["action"] == "recommend"
         assert "樱花树下" in result["response"]
@@ -725,7 +744,7 @@ class TestImageSubAgent:
             "messages": [HumanMessage(content="夏天的图")],
             "image_prompt": "夏天的图",
         }
-        result = image_agent.process(state, "你帮我扩展一下吧")
+        result = _run_image_workflow(image_agent, state, "你帮我扩展一下吧")
 
         assert result["action"] == "ask_confirm"
         assert "扩写后的描述" in result["response"]
@@ -733,7 +752,7 @@ class TestImageSubAgent:
 
     def test_finish_when_satisfied(self, image_agent):
         """用户满意后，子Agent应返回结束动作。"""
-        result = image_agent.process({}, "真好看，谢谢")
+        result = _run_image_workflow(image_agent, {}, "真好看，谢谢")
 
         assert result["action"] == "finish"
         assert "喜欢就好" in result["response"]
@@ -746,7 +765,7 @@ class TestImageSubAgent:
             "image_prompt": "夕阳下看大海的少女",
             "confirmed_prompt": "夕阳下看大海的少女",
         }
-        result = image_agent.process(state, "可以")
+        result = _run_image_workflow(image_agent, state, "可以")
 
         assert result["action"] == "generate"
         assert result["prompt"] == "夕阳下看大海的少女"
@@ -760,7 +779,7 @@ class TestImageSubAgent:
             "image_prompt": "二次元风格，高中女生打着伞",
             "confirmed_prompt": "二次元风格，高中女生打着伞",
         }
-        result = image_agent.process(state, "就这个描述")
+        result = _run_image_workflow(image_agent, state, "就这个描述")
 
         assert result["action"] == "generate"
         assert result["prompt"] == "二次元风格，高中女生打着伞"
@@ -774,7 +793,7 @@ class TestImageSubAgent:
             "image_prompt": "二次元风格，高中女生打着伞",
             "confirmed_prompt": "二次元风格，高中女生打着伞",
         }
-        result = image_agent.process(state, "帮我扩写提示词")
+        result = _run_image_workflow(image_agent, state, "帮我扩写提示词")
 
         assert result["action"] == "ask_confirm"
         assert "扩写后的描述" in result["response"]
@@ -789,7 +808,7 @@ class TestImageSubAgent:
             "last_prompt": "夕阳下看大海的少女",
             "last_image_urls": ["https://example.com/a.jpeg"],
         }
-        result = image_agent.process(state, "可以")
+        result = _run_image_workflow(image_agent, state, "可以")
 
         assert result["action"] == "finish"
         assert result["data"]["state_update"]["image_phase"] == "finished"
@@ -803,7 +822,7 @@ class TestImageSubAgent:
             "last_prompt": "夕阳下看大海的少女",
             "last_image_urls": ["https://example.com/a.jpeg"],
         }
-        result = image_agent.process(state, "不可以")
+        result = _run_image_workflow(image_agent, state, "不可以")
 
         assert result["action"] != "finish"
         assert result["data"]["state_update"]["image_phase"] == "awaiting_image_confirm"
@@ -817,13 +836,13 @@ class TestImageSubAgent:
             "last_prompt": "夏天的图",
             "last_image_urls": ["https://example.com/a.jpeg"],
         }
-        expanded = image_agent.process(state, "扩写一下我的提示词")
+        expanded = _run_image_workflow(image_agent, state, "扩写一下我的提示词")
 
         assert expanded["action"] == "ask_confirm"
         assert expanded["data"]["state_update"]["image_phase"] == "awaiting_prompt_confirm"
 
         state.update(expanded["data"]["state_update"])
-        generated = image_agent.process(state, "可以")
+        generated = _run_image_workflow(image_agent, state, "可以")
 
         assert generated["action"] == "generate"
         assert generated["data"]["state_update"]["image_phase"] == "awaiting_generation"
@@ -837,7 +856,7 @@ class TestImageSubAgent:
             "last_prompt": "星空下的少女",
             "last_image_urls": ["https://example.com/a.jpeg"],
         }
-        result = image_agent.process(state, "换一张")
+        result = _run_image_workflow(image_agent, state, "换一张")
 
         assert result["action"] == "generate"
         assert "星空下的少女" in result["prompt"]
@@ -851,7 +870,7 @@ class TestImageSubAgent:
             "last_prompt": "星空下的少女",
             "last_image_urls": ["https://example.com/a.jpeg"],
         }
-        result = image_agent.process(state, "我重新输入一组提示词：雨夜霓虹街道")
+        result = _run_image_workflow(image_agent, state, "我重新输入一组提示词：雨夜霓虹街道")
 
         assert result["action"] == "ask_confirm"
         assert "雨夜霓虹街道" in result["prompt"]
@@ -866,7 +885,7 @@ class TestImageSubAgent:
             "last_prompt": "二次元风格，高中女生打着伞",
             "last_image_urls": ["https://example.com/a.jpeg"],
         }
-        result = image_agent.process(state, "二次元风格，生成一张在草坪躺着的jk少女")
+        result = _run_image_workflow(image_agent, state, "二次元风格，生成一张在草坪躺着的jk少女")
 
         assert result["action"] == "ask_confirm"
         assert "草坪躺着的jk少女" in result["prompt"]
@@ -874,7 +893,7 @@ class TestImageSubAgent:
         assert result["data"]["state_update"]["image_phase"] == "awaiting_prompt_confirm"
 
         state.update(result["data"]["state_update"])
-        generated = image_agent.process(state, "可以")
+        generated = _run_image_workflow(image_agent, state, "可以")
 
         assert generated["action"] == "generate"
         assert "草坪躺着的jk少女" in generated["prompt"]
@@ -889,7 +908,7 @@ class TestImageSubAgent:
 
     def test_standardized_result_format(self, image_agent):
         """子Agent返回结果应符合统一格式。"""
-        result = image_agent.process({}, "我想生成图片")
+        result = _run_image_workflow(image_agent, {}, "我想生成图片")
 
         assert set(result) == {"action", "response", "prompt", "provider", "data"}
 
@@ -899,7 +918,7 @@ class TestMainAgentIntegration:
 
     def test_chat_directly(self, main_agent):
         """普通聊天应由主Agent直接回复。"""
-        result = main_agent.process({"messages": []}, "你好")
+        result = main_agent.invoke("你好")
 
         assert len(result["messages"]) == 1
         assert isinstance(result["messages"][0], AIMessage)
@@ -907,68 +926,77 @@ class TestMainAgentIntegration:
 
     def test_delegate_to_image_agent(self, main_agent):
         """模糊生图需求应委派给生图子Agent追问。"""
-        result = main_agent.process({"messages": []}, "我想生成图片")
+        thread_id = "test-delegate-to-image"
+        result = main_agent.invoke("我想生成图片", thread_id=thread_id)
+        current_subagent = main_agent.get_state(thread_id)["current_subagent"]
 
         assert len(result["messages"]) == 1
         assert "请告诉我" in result["messages"][0].content
-        assert result["active_subagent"]["agent_type"] == "image"
-        assert "agent" not in result["active_subagent"]
-        assert "skill_registry" not in result["active_subagent"]["state"]
+        assert current_subagent["agent_type"] == "image"
+        assert "agent" not in current_subagent
+        assert "skill_registry" not in current_subagent["state"]
 
     def test_delegate_initial_image_request(self, main_agent):
         """用户说要生图时，应委派生图Agent并追问画面描述。"""
-        result = main_agent.process({"messages": []}, "我要生图")
+        thread_id = "test-delegate-initial-image"
+        result = main_agent.invoke("我要生图", thread_id=thread_id)
+        current_subagent = main_agent.get_state(thread_id)["current_subagent"]
 
         assert len(result["messages"]) == 1
         assert "请告诉我您想要生成什么样的图片" in result["messages"][0].content
-        assert result["active_subagent"]["agent_type"] == "image"
+        assert current_subagent["agent_type"] == "image"
 
     def test_image_description_is_delegated_to_subagent(self, main_agent):
         """主Agent处理生图描述时，应通过 task_tool 转入子Agent确认流程。"""
-        result = main_agent.process({"messages": []}, "画一只猫")
+        thread_id = "test-image-description-delegated"
+        result = main_agent.invoke("画一只猫", thread_id=thread_id)
+        current_subagent = main_agent.get_state(thread_id)["current_subagent"]
 
-        assert result.get("pending_generation") is None
-        assert result["active_subagent"]["agent_type"] == "image"
-        assert result["active_subagent"]["state"]["image_phase"] == "awaiting_prompt_confirm"
+        assert current_subagent["agent_type"] == "image"
+        assert current_subagent["state"]["image_phase"] == "awaiting_prompt_confirm"
         assert "如果这个描述可以" in result["messages"][0].content
+
+    def test_task_tool_executes_subagent_inside_graph_tool_loop(self, main_agent):
+        """task_tool 应在 LangGraph 工具循环内执行子Agent并写入状态。"""
+        thread_id = "test-task-tool-executor-state"
+        main_agent.invoke("画一只猫", thread_id=thread_id)
+        snapshot = main_agent.agent.get_state(main_agent._graph_config(thread_id))
+        messages = snapshot.values["messages"]
+
+        assert any(
+            getattr(message, "type", None) == "tool"
+            and getattr(message, "name", "") == "task_tool"
+            and "如果这个描述可以" in str(message.content)
+            for message in messages
+        )
+        assert snapshot.values["current_subagent"]["agent_type"] == "image"
 
     def test_confirm_prompt_after_delegation_starts_generation(self, main_agent):
         """提示词确认后，用户回复可以应进入生图，而不是重复确认。"""
-        delegated = main_agent.process({"messages": []}, "画一只猫")
+        thread_id = "test-confirm-prompt-after-delegation"
+        main_agent.invoke("画一只猫", thread_id=thread_id)
+        result = main_agent.invoke("可以", thread_id=thread_id)
+        current_subagent = main_agent.get_state(thread_id)["current_subagent"]
 
-        result = main_agent.process(
-            {
-                "messages": [],
-                "active_subagent": delegated["active_subagent"],
-            },
-            "可以",
-        )
-
-        assert result.get("pending_generation") is True
-        assert result["active_subagent"]["state"]["image_phase"] == "awaiting_generation"
-        assert result["prompt"] == "画一只猫"
+        assert current_subagent["state"]["image_phase"] == "awaiting_image_confirm"
+        assert current_subagent["state"]["last_prompt"] == "画一只猫"
+        assert result["artifacts"][0]["url"] == "https://example.com/generated.jpeg"
         assert "如果这个描述可以" not in result["messages"][0].content
 
     def test_chat_after_image_generation(self, main_agent):
-        """没有 active_subagent 时，普通反馈不应再次进入生图流程。"""
-        messages = [
-            HumanMessage(content="我想生成图片"),
-            AIMessage(content="请告诉我您想要生成什么样的图片？"),
-            HumanMessage(content="夕阳下看大海的少女"),
-            AIMessage(content="图片已生成完成"),
-        ]
-        result = main_agent.process({"messages": messages}, "真好看")
+        """没有 current_subagent 时，普通反馈不应再次进入生图流程。"""
+        result = main_agent.invoke("真好看", thread_id="test-chat-after-image")
 
         assert "image_url" not in result
         assert len(result["messages"]) == 1
         assert "你好呀" in result["messages"][0].content
 
-    def test_clear_subagent_after_user_accepts_generated_image(self, main_agent):
+    def test_current_subagent_clears_after_user_accepts_generated_image(self, main_agent):
         """图片确认阶段用户礼貌收尾时，应结束生图子Agent并清空上下文。"""
-        image_agent = main_agent.subagent_registry.get("image")
-        active_subagent = {
+        thread_id = "test-clear-subagent-after-accept"
+        current_subagent = {
             "agent_type": "image",
-            "agent": image_agent,
+            "thread_id": f"{thread_id}:image",
             "state": {
                 "image_task_type": "generate_image",
                 "image_phase": "awaiting_image_confirm",
@@ -981,16 +1009,14 @@ class TestMainAgentIntegration:
                 AIMessage(content="[图片] https://example.com/a.jpeg\n\n这张图片可以吗？"),
             ],
         }
-
-        result = main_agent.process(
-            {
-                "messages": [],
-                "active_subagent": active_subagent,
-            },
-            "可以了，谢谢",
+        main_agent.agent.update_state(
+            main_agent._graph_config(thread_id),
+            {"current_subagent": current_subagent},
         )
 
-        assert result.get("clear_subagent") is True
+        result = main_agent.invoke("可以了，谢谢", thread_id=thread_id)
+
+        assert main_agent.get_state(thread_id).get("current_subagent") is None
         assert "喜欢就好" in result["messages"][0].content
 
     def test_subagent_receives_shared_runtime(self, main_agent):
@@ -1010,7 +1036,7 @@ class TestMainAgentIntegration:
         main_agent._runtime._mcp_tools = [fake_mcp_video_info]
         main_agent._refresh_tools_with_mcp()
 
-        result = main_agent.process({"messages": []}, "读取视频信息 F:/videos/a.mp4")
+        result = main_agent.invoke("读取视频信息 F:/videos/a.mp4")
 
         assert "视频信息" in result["messages"][0].content
         assert "F:/videos/a.mp4" in result["messages"][0].content
@@ -1029,23 +1055,21 @@ class TestMainAgentIntegration:
         assert agent._runtime.mcp_loaded is False
         assert "load_mcp_tools_tool" in agent.tool_map
 
-    def test_create_main_agent_keeps_legacy_process_interface(self, llm):
-        """create_main_agent 返回对象仍支持 process 接口。"""
-        from huesaeagents.huesae.agents.lead_agent import create_main_agent
+    def test_main_agent_exposes_only_deerflow_runtime_interface(self, llm):
+        """主Agent只暴露 DeerFlow 风格 invoke 接口。"""
+        agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: [])
+        result = agent.invoke("你好")
 
-        agent = create_main_agent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: [])
-        result = agent.process({"messages": []}, "你好")
-
+        assert not hasattr(agent, "process")
         assert isinstance(result["messages"][0], AIMessage)
         assert "你好呀" in result["messages"][0].content
 
     def test_graph_checkpointer_restores_same_thread(self, llm):
         """同一 thread_id 下 LangGraph checkpointer 应保留对话状态。"""
         agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: [])
-        state = {"messages": [], "thread_id": "thread-a"}
 
-        agent.process(state, "你好")
-        snapshot = agent.agent.get_state(agent._graph_config(state))
+        agent.invoke("你好", thread_id="thread-a")
+        snapshot = agent.agent.get_state(agent._graph_config("thread-a"))
 
         assert any(getattr(message, "type", None) == "human" for message in snapshot.values["messages"])
 
@@ -1053,8 +1077,8 @@ class TestMainAgentIntegration:
         """不同 thread_id 的 LangGraph 状态应相互隔离。"""
         agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: [])
 
-        agent.process({"messages": [], "thread_id": "thread-a"}, "你好")
-        snapshot_b = agent.agent.get_state(agent._graph_config({"thread_id": "thread-b"}))
+        agent.invoke("你好", thread_id="thread-a")
+        snapshot_b = agent.agent.get_state(agent._graph_config("thread-b"))
 
         assert not snapshot_b.values
 
@@ -1067,7 +1091,7 @@ class TestMainAgentIntegration:
             return []
 
         agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=fake_loader)
-        result = agent.process({"messages": []}, "加载视频MCP")
+        result = agent.invoke("加载视频MCP")
 
         assert len(calls) == 1
         assert agent._runtime.mcp_loaded is True
@@ -1088,7 +1112,7 @@ class TestMainAgentIntegration:
     def test_video_mcp_analyze_video_content(self, llm):
         """主Agent应选择 MCP 视频内容分析工具处理本地视频分析。"""
         agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: _fake_video_mcp_tools())
-        result = agent.process({"messages": []}, f"这是本地视频{VIDEO_PATH}，请帮分析视频内容")
+        result = agent.invoke(f"这是本地视频{VIDEO_PATH}，请帮分析视频内容")
 
         assert "视频内容分析结果" in result["messages"][0].content
         assert VIDEO_PATH in result["messages"][0].content
@@ -1096,7 +1120,7 @@ class TestMainAgentIntegration:
     def test_video_mcp_analyze_single_image(self, llm):
         """主Agent应选择图片批量分析工具处理单张本地图片分析。"""
         agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: _fake_video_mcp_tools())
-        result = agent.process({"messages": []}, f"这是本地图片{IMAGE_PATH_1}，请帮我基于图片分析图片内容")
+        result = agent.invoke(f"这是本地图片{IMAGE_PATH_1}，请帮我基于图片分析图片内容")
 
         assert "图片内容分析结果" in result["messages"][0].content
         assert IMAGE_PATH_1 in result["messages"][0].content
@@ -1105,7 +1129,7 @@ class TestMainAgentIntegration:
         """主Agent应选择图片批量分析工具处理多张本地图片分析。"""
         agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: _fake_video_mcp_tools())
         user_input = f"这是本地图片1{IMAGE_PATH_1}，本地图片2{IMAGE_PATH_2}，本地图片3{IMAGE_PATH_3}，请帮我基于图片分析图片内容"
-        result = agent.process({"messages": []}, user_input)
+        result = agent.invoke(user_input)
 
         assert "图片内容分析结果" in result["messages"][0].content
         assert IMAGE_PATH_1 in result["messages"][0].content
@@ -1115,7 +1139,7 @@ class TestMainAgentIntegration:
         """主Agent应选择图片脚本工具处理基于图片生成拍摄脚本。"""
         agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: _fake_video_mcp_tools())
         user_input = f"这是本地图片1{IMAGE_PATH_1}，本地图片2{IMAGE_PATH_2}，本地图片3{IMAGE_PATH_3}，请帮我基于图片生成专业拍摄脚本"
-        result = agent.process({"messages": []}, user_input)
+        result = agent.invoke(user_input)
 
         assert "图片脚本生成结果" in result["messages"][0].content
         assert IMAGE_PATH_2 in result["messages"][0].content
@@ -1123,7 +1147,7 @@ class TestMainAgentIntegration:
     def test_video_mcp_generate_video_script(self, llm):
         """主Agent应选择视频脚本工具处理基于视频生成拍摄脚本。"""
         agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: _fake_video_mcp_tools())
-        result = agent.process({"messages": []}, f"这是本地视频{VIDEO_PATH}，请帮我基于视频内容生成专业拍摄脚本")
+        result = agent.invoke(f"这是本地视频{VIDEO_PATH}，请帮我基于视频内容生成专业拍摄脚本")
 
         assert "视频脚本生成结果" in result["messages"][0].content
         assert VIDEO_PATH in result["messages"][0].content
@@ -1131,7 +1155,7 @@ class TestMainAgentIntegration:
     def test_video_mcp_get_video_info(self, llm):
         """主Agent应使用 videoPath 参数调用视频基本信息工具。"""
         agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: _fake_video_mcp_tools())
-        result = agent.process({"messages": []}, f"这是视频地址{VIDEO_PATH}，获取视频文件基本信息")
+        result = agent.invoke(f"这是视频地址{VIDEO_PATH}，获取视频文件基本信息")
 
         assert "视频信息" in result["messages"][0].content
         assert VIDEO_PATH in result["messages"][0].content
@@ -1145,7 +1169,7 @@ class TestMainAgentIntegration:
             return _fake_video_mcp_tools()
 
         agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=fake_loader)
-        result = agent.process({"messages": []}, f"这是视频地址{VIDEO_PATH}，获取视频文件基本信息")
+        result = agent.invoke(f"这是视频地址{VIDEO_PATH}，获取视频文件基本信息")
 
         assert len(calls) == 1
         assert "视频信息" in result["messages"][0].content
@@ -1167,7 +1191,7 @@ class TestMainAgentIntegration:
         agent.tool_map["reverse_image_prompt"] = fake_reverse_image_prompt
         agent.tools.append(fake_reverse_image_prompt)
 
-        result = agent.process({"messages": []}, f"这张图片{IMAGE_PATH_1}，反推提示词")
+        result = agent.invoke(f"这张图片{IMAGE_PATH_1}，反推提示词")
 
         assert "反推提示词" in result["messages"][0].content
         assert IMAGE_PATH_1 in result["messages"][0].content
@@ -1188,7 +1212,7 @@ class TestMainAgentIntegration:
         agent.tool_map["reverse_image_prompt"] = reverse_tool
         agent.tools.append(reverse_tool)
 
-        result = agent.process({"messages": []}, f"这张图片{IMAGE_PATH_1}，反推提示词")
+        result = agent.invoke(f"这张图片{IMAGE_PATH_1}，反推提示词")
 
         assert result.get("vision_context", {}).get("image_path") == IMAGE_PATH_1
         assert result.get("vision_context", {}).get("last_reverse_prompt") == f"反推提示词：{IMAGE_PATH_1}"
@@ -1196,7 +1220,7 @@ class TestMainAgentIntegration:
     def test_douyin_mcp_download_video(self, llm):
         """主Agent应动态调用抖音 MCP 的下载链接工具。"""
         agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: _fake_all_mcp_tools())
-        result = agent.process({"messages": []}, f"{DOUYIN_URL}，下载视频")
+        result = agent.invoke(f"{DOUYIN_URL}，下载视频")
 
         assert "抖音视频下载链接" in result["messages"][0].content
         assert DOUYIN_URL in result["messages"][0].content
@@ -1205,7 +1229,7 @@ class TestMainAgentIntegration:
     def test_bilibili_mcp_get_video_info(self, llm):
         """主Agent应动态调用 B站 MCP 的视频信息工具。"""
         agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: _fake_all_platform_mcp_tools())
-        result = agent.process({"messages": []}, f"获取这个B站视频的信息：{BILIBILI_URL}")
+        result = agent.invoke(f"获取这个B站视频的信息：{BILIBILI_URL}")
 
         assert "B站视频信息" in result["messages"][0].content
         assert BILIBILI_URL in result["messages"][0].content
@@ -1213,7 +1237,7 @@ class TestMainAgentIntegration:
     def test_bilibili_mcp_download_video(self, llm):
         """主Agent应动态调用 B站 MCP 的下载视频工具。"""
         agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: _fake_all_platform_mcp_tools())
-        result = agent.process({"messages": []}, f"下载这个B站视频：{BILIBILI_URL}")
+        result = agent.invoke(f"下载这个B站视频：{BILIBILI_URL}")
 
         assert "B站视频已下载" in result["messages"][0].content
         assert BILIBILI_URL in result["messages"][0].content
@@ -1221,7 +1245,7 @@ class TestMainAgentIntegration:
     def test_fysh_bilibili_mcp_parse_video(self, llm):
         """主Agent应动态调用 fysh1010/bilibili-mcp 的解析工具。"""
         agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=lambda *args, **kwargs: _fake_all_bilibili_mcp_tools())
-        result = agent.process({"messages": []}, f"解析这个B站视频：{BILIBILI_URL}")
+        result = agent.invoke(f"解析这个B站视频：{BILIBILI_URL}")
 
         assert "fysh B站视频解析结果" in result["messages"][0].content
         assert BILIBILI_URL in result["messages"][0].content
@@ -1235,7 +1259,7 @@ class TestMainAgentIntegration:
             return _fake_video_mcp_tools()
 
         agent = HuesaeMainAgent(llm=llm, mcp_tools_loader=fake_loader)
-        result = agent.process({"messages": []}, "MCP未加载时直接猜测视频信息工具")
+        result = agent.invoke("MCP未加载时直接猜测视频信息工具")
 
         assert len(calls) == 1
         assert "视频信息" in result["messages"][0].content
@@ -1272,7 +1296,7 @@ class TestMainAgentIntegration:
             def name(self):
                 return "general"
 
-            def process(self, state: dict, user_input: str) -> dict:
+            def invoke(self, user_input: str, *, thread_id: str, state: dict | None = None) -> dict:
                 return {
                     "action": "finish",
                     "response": "通用任务结果：已完成报告整理",
@@ -1283,9 +1307,8 @@ class TestMainAgentIntegration:
 
         agent.register_sub_agent(_StubGeneralAgent())
 
-        result = agent.process({"messages": []}, "帮我整理一份报告")
+        result = agent.invoke("帮我整理一份报告")
 
-        assert result.get("clear_subagent") is True
         assert "通用任务结果" in result["messages"][0].content
 
 
@@ -1300,7 +1323,7 @@ class TestGeneralSubAgent:
         runtime.get_tools = lambda **kwargs: [fake_general_echo_tool]
         runtime.get_tool_map = lambda **kwargs: {"general_echo_tool": fake_general_echo_tool}
 
-        result = general_agent.process({"messages": []}, "帮我整理一份报告")
+        result = general_agent.invoke("帮我整理一份报告", thread_id="test-general-agent")
 
         assert result["action"] == "finish"
         assert "通用任务结果" in result["response"]
@@ -1412,7 +1435,7 @@ class TestAgentMiddlewares:
             mcp_tools_loader=lambda *args, **kwargs: [],
             middleware_pipeline=MiddlewarePipeline([_MainAgentMiddleware()]),
         )
-        result = agent.process({"messages": []}, "你好")
+        result = agent.invoke("你好")
 
         assert "你好呀" in result["messages"][0].content
         assert calls == ["before_agent", "before_model", "after_model", "after_agent"]

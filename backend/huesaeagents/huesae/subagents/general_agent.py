@@ -118,13 +118,14 @@ class GeneralSubAgent(BaseSubAgent):
             name="huesae_general_agent",
         )
 
-    def process(self, state: dict, user_input: str) -> dict:
-        """执行主Agent委派的通用任务。"""
+    def invoke(self, user_input: str, *, thread_id: str, state: dict | None = None) -> dict:
+        """Run the general subagent in its own create_agent graph."""
+        state = state or {}
         self._refresh_tools()
         try:
             graph_state = self.agent.invoke(
                 {"messages": [HumanMessage(content=user_input)], "user_input": user_input},
-                config={"configurable": {"thread_id": str(state.get("thread_id") or f"general-{id(state)}")}},
+                config={"configurable": {"thread_id": str(thread_id)}},
             )
         except Exception as exc:
             return self._make_result("error", f"通用任务执行失败：{exc}")

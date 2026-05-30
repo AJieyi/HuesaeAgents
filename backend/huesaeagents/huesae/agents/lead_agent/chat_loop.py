@@ -23,7 +23,6 @@ if __package__ is None:
         sys.path.insert(0, str(_backend_dir))
     __package__ = "huesaeagents.huesae.agents.lead_agent"
 
-import asyncio
 import logging
 import os
 import sys
@@ -38,14 +37,11 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-from langchain.messages import HumanMessage, AIMessage
-
-
 _CONSOLE_OUTPUT_LOCK = threading.RLock()
 
 
 class _ConsoleLogHandler(logging.StreamHandler):
-    """Write logs through the same lock used by streaming terminal output."""
+    """Write logs through the same lock used by streaming terminal output.通过与流式终端输出所使用的锁相同的锁来写入日志"""
 
     def emit(self, record: logging.LogRecord) -> None:
         with _CONSOLE_OUTPUT_LOCK:
@@ -97,7 +93,7 @@ def run_chat_loop():
     """
     configure_chat_loop_logging()
 
-    from .lead_agent import create_main_agent
+    from .lead_agent import HuesaeMainAgent
     from ...skills.registry import SkillRegistry
     from ...services import create_honcho_memory_service
     from ...subagents.general_agent import create_general_agent
@@ -106,14 +102,12 @@ def run_chat_loop():
     # 创建主Agent并注册子Agent
     skill_registry = SkillRegistry()
     memory_service = create_honcho_memory_service()
-    main_agent = create_main_agent(skill_registry=skill_registry, memory_service=memory_service)
+    main_agent = HuesaeMainAgent(skill_registry=skill_registry, memory_service=memory_service)
     main_agent.register_sub_agent(create_image_agent())
     main_agent.register_sub_agent(create_general_agent(skill_registry=skill_registry, runtime=main_agent._runtime))
 
-    # 终端交互保留当前进程状态，同时把跨终端记忆写入 Honcho。
-    messages = []
-    active_subagent = None
-    vision_context = None
+    # 对话状态由主Agent的 LangGraph checkpointer 维护。
+    thread_id = "chat-loop"
 
     print("=" * 50)
     print("HuesaeAgents 终端交互")
@@ -140,88 +134,15 @@ def run_chat_loop():
         if not user_input:
             continue
 
-        state = {
-            "messages": messages,
-            "active_subagent": active_subagent,
-            "vision_context": vision_context,
-        }
+        # 调用主Agent，状态/路由/子Agent续聊均由 LangGraph checkpointer 管理。
+        result = main_agent.invoke(user_input, thread_id=thread_id)
 
-        # 调用主Agent（ReAct 循环）
-        result = main_agent.process(state, user_input)
-        # 处理 pending_generation（子Agent或工具触发的异步生图）
-        if result.get("pending_generation"):
-            prompt = result.get("prompt", "")
-            size = result.get("size", "2K")
-            output_format = result.get("output_format", "jpeg")
-            is_batch = result.get("is_batch", False)
-
-            print_stream("图片正在生成中，请稍等~")
-            print()
-
-            try:
-                # 异步执行生图
-                image_result = asyncio.run(main_agent.execute_image_generation(
-                    prompt=prompt,
-                    size=size,
-                    output_format=output_format,
-                    is_batch=is_batch,
-                ))
-
-                # 构造完整回复（包装语 + 图片URL）
-                wrap_msg = image_result["wrap_message"]
-                confirm_msg = image_result.get("confirm_message", "")
-                if image_result.get("image_urls"):
-                    images_text = "\n".join(
-                        [f"[图片] {url}" for url in image_result["image_urls"]]
-                    )
-                    full_msg = f"{wrap_msg}\n\n{images_text}\n\n{confirm_msg}"
-                else:
-                    full_msg = f"{wrap_msg}\n\n[图片] {image_result['image_url']}\n\n{confirm_msg}"
-
-                # 替换 result 中的消息为完整回复
-                result["messages"] = [AIMessage(content=full_msg)]
-                if result.get("active_subagent"):
-                    active_state = result["active_subagent"].setdefault("state", {})
-                    active_state.update(image_result.get("subagent_state_update", {}))
-                    history = result["active_subagent"].setdefault("history", [])
-                    if history and isinstance(history[-1], AIMessage):
-                        history[-1] = AIMessage(content=full_msg)
-
-                # 流式打印包装语
-                print_stream(wrap_msg)
+        # 流式打印AI回复（打字机效果）
+        for msg in result.get("messages", []):
+            content = msg.content if hasattr(msg, "content") else str(msg)
+            if content.strip():
+                print_stream(content)
                 print()
-
-                # 显示图片URL
-                if image_result.get("image_urls"):
-                    for url in image_result["image_urls"]:
-                        print(f"[图片] {url}\n")
-                else:
-                    print(f"[图片] {image_result['image_url']}\n")
-                if confirm_msg:
-                    print_stream(confirm_msg)
-                    print()
-
-            except Exception as e:
-                error_msg = f"图片生成失败：{str(e)}"
-                print_stream(error_msg)
-                print()
-                result["messages"] = [AIMessage(content=error_msg)]
-
-        else:
-            # 流式打印AI回复（打字机效果）
-            for msg in result.get("messages", []):
-                content = msg.content if hasattr(msg, "content") else str(msg)
-                if content.strip():
-                    print_stream(content)
-                    print()
-
-        # 更新子Agent状态
-        if "active_subagent" in result:
-            active_subagent = result["active_subagent"]
-        if result.get("clear_subagent"):
-            active_subagent = None
-        if "vision_context" in result:
-            vision_context = result["vision_context"]
 
         assistant_response = "\n".join(
             msg.content if hasattr(msg, "content") else str(msg)
@@ -231,10 +152,6 @@ def run_chat_loop():
 
         if assistant_response:
             memory_service.store_exchange(user_input, assistant_response)
-
-        # 更新主对话历史
-        messages.append(HumanMessage(content=user_input))
-        messages.extend(result.get("messages", []))
 
 
 if __name__ == "__main__":

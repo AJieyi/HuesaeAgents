@@ -208,10 +208,17 @@ class SharedToolRuntime:
     @staticmethod
     def _format_tool_args(tool: BaseTool) -> str:
         """把工具参数 schema 压缩成适合提示词展示的字段列表。"""
+        visible_args = getattr(tool, "args", None)
+        if isinstance(visible_args, dict) and visible_args:
+            return f" 参数：{list(visible_args.keys())}"
+
         args_schema = getattr(tool, "args_schema", None)
         if args_schema is None or not hasattr(args_schema, "model_json_schema"):
             return ""
-        schema = args_schema.model_json_schema()
+        try:
+            schema = args_schema.model_json_schema()
+        except Exception:
+            return ""
         properties = schema.get("properties") or {}
         if not properties:
             return ""

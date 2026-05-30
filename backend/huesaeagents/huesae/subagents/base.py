@@ -9,19 +9,20 @@ from typing import Any
 class BaseSubAgent(ABC):
     """子Agent基类
 
-    所有子Agent必须实现 process 方法，返回标准化结果。
-    子Agent本身是无状态的，每次调用接收完整对话历史做决策。
+    所有子Agent必须实现 invoke 方法，返回标准化结果。
+    子Agent通过自己的 LangGraph runtime 管理局部状态。
     """
 
     runtime: Any | None = None
 
     @abstractmethod
-    def process(self, state: dict, user_input: str) -> dict:
+    def invoke(self, user_input: str, *, thread_id: str, state: dict | None = None) -> dict:
         """处理用户输入，返回标准化结果
 
         Args:
-            state: 当前状态，包含 messages 等
             user_input: 用户最新输入
+            thread_id: 子Agent线程ID
+            state: 可选的局部状态补充
 
         Returns:
             dict: 标准化结果，必须包含以下字段：

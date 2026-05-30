@@ -1,8 +1,4 @@
-"""Agent 工具入口（DeerFlow Harness Engineering 模式）。
-
-工具选择由 LLM 自主决定，系统只提供工具列表和描述。
-主Agent通过 ReAct 循环让 LLM 自主决策调用哪个工具。
-"""
+"""Agent 工具入口（DeerFlow Harness Engineering 模式）。"""
 import subprocess
 from typing import Literal
 
@@ -276,8 +272,6 @@ def get_builtin_tools(
             available = ", ".join(subagent_registry.names()) or "无"
             return f"错误：未知子Agent {subagent_type}。可用子Agent：{available}"
 
-        # task_tool 不实际执行子Agent；它向主Agent返回一个结构化标记，
-        # 由主Agent统一管理子Agent上下文和多轮状态。
         return encode_subagent_task(subagent_type, description)
 
     if subagent_registry is not None:

@@ -13,6 +13,10 @@ class RegisteredSubAgent(Protocol):
     name: str
     runtime: object | None
 
+    def invoke(self, user_input: str, *, thread_id: str, state: dict | None = None) -> dict:
+        """Run the subagent in its own graph context."""
+        ...
+
 
 @dataclass(frozen=True)
 class SubAgentInfo:
