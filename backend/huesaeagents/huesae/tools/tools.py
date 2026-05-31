@@ -3,7 +3,6 @@ import subprocess
 from typing import Literal
 
 from langchain.tools import BaseTool, tool
-from pydantic import BaseModel, Field
 from langchain_core.language_models import BaseChatModel
 from langchain.messages import HumanMessage
 
@@ -11,79 +10,7 @@ from ..skills.registry import SkillRegistry
 from ..subagents.registry import SubAgentRegistry
 
 
-# ============== LLM 决策模型 ==============
-
-class Action(BaseModel):
-    """LLM 决策：选择直接回复或调用工具。"""
-
-    thought: str = Field(description="分析用户需求和当前状态，思考应该采取什么行动")
-    type: Literal["reply", "tool_call"] = Field(
-        description="行动类型：reply=直接回复用户，tool_call=调用工具"
-    )
-    tool_name: str | None = Field(
-        default=None,
-        description="当 type=tool_call 时，要调用的当前可见工具名称"
-    )
-    tool_args: dict | None = Field(
-        default=None,
-        description="当 type=tool_call 时，以JSON对象形式传递工具参数"
-    )
-    response: str | None = Field(
-        default=None,
-        description="当 type=reply 时，给用户的直接回复内容"
-    )
-
-
-SUBAGENT_TASK_PREFIX = "__SUBAGENT_TASK__"
 LOAD_MCP_TOOLS_SIGNAL = "__LOAD_MCP_TOOLS__"
-
-
-def encode_subagent_task(subagent_type: str, description: str) -> str:
-    """编码子Agent委派结果，供主Agent识别。"""
-    return f"{SUBAGENT_TASK_PREFIX}:{subagent_type}:{description}"
-
-
-def parse_subagent_task(result: str) -> tuple[str, str] | None:
-    """解析子Agent委派结果。"""
-    if not result.startswith(SUBAGENT_TASK_PREFIX):
-        return None
-    parts = result.split(":", 2)
-    if len(parts) < 3:
-        return None
-    return parts[1], parts[2]
-
-
-def is_load_mcp_tools_signal(result: str) -> bool:
-    """判断工具结果是否要求主Agent加载 MCP 工具。"""
-    return result == LOAD_MCP_TOOLS_SIGNAL
-
-
-class ToolRegistry:
-    """运行时工具注册表。"""
-
-    def __init__(self):
-        self.tools: list[BaseTool] = []
-        self._tool_map: dict[str, BaseTool] = {}
-
-    def register(self, tool_obj: BaseTool) -> None:
-        """注册单个工具。"""
-        if tool_obj.name in self._tool_map:
-            return
-        self.tools.append(tool_obj)
-        self._tool_map[tool_obj.name] = tool_obj
-
-    def extend(self, tools: list[BaseTool]) -> None:
-        """批量注册工具。"""
-        for tool_obj in tools:
-            self.register(tool_obj)
-
-    def get(self, name: str) -> BaseTool | None:
-        """按名称获取工具。"""
-        return self._tool_map.get(name)
-
-    def names(self) -> list[str]:
-        """返回所有工具名称。"""
-        return list(self._tool_map.keys())
 
 
 # ============== 工具创建工厂 ==============
@@ -252,6 +179,9 @@ def get_builtin_tools(
     def task_tool(description: str, subagent_type: str = "image") -> str:
         """委托子Agent处理复杂任务。当任务需要多步骤、专业处理、多轮对话时使用此工具。
 
+        此工具由 RuntimeToolMiddleware 在 LangGraph 工具调用阶段拦截执行。
+        正常运行时不会进入函数体；函数体仅作为未安装中间件时的兜底错误提示。
+
         使用场景：
         - 用户表达生图需求但没有提供具体描述（需要追问）
         - 用户要求推荐图片主题
@@ -272,7 +202,7 @@ def get_builtin_tools(
             available = ", ".join(subagent_registry.names()) or "无"
             return f"错误：未知子Agent {subagent_type}。可用子Agent：{available}"
 
-        return encode_subagent_task(subagent_type, description)
+        return "错误：task_tool 必须由 RuntimeToolMiddleware 执行，请检查主Agent中间件配置。"
 
     if subagent_registry is not None:
         task_tool.description = (
@@ -281,8 +211,7 @@ def get_builtin_tools(
             + subagent_registry.format_for_prompt()
         )
 
-    registry = ToolRegistry()
-    registry.extend([
+    return [
         generate_image_tool,
         generate_images_tool,
         expand_prompt_tool,
@@ -292,56 +221,4 @@ def get_builtin_tools(
         read_skill_tool,
         bash_tool,
         task_tool,
-    ])
-    return registry.tools
-
-
-def get_available_tools(
-    llm: BaseChatModel,
-    subagent_registry: SubAgentRegistry | None = None,
-    *,
-    include_mcp: bool = True,
-    include_task_tool: bool = True,
-    runtime=None,
-    skill_registry: SkillRegistry | None = None,
-) -> list[BaseTool]:
-    """获取调用方可见的工具列表。
-
-    主Agent使用 include_task_tool=True；子Agent使用 include_task_tool=False，
-    从架构上禁止子Agent继续委派其他子Agent。
-    """
-    if runtime is not None:
-        return runtime.get_tools(
-            include_mcp=include_mcp,
-            include_task_tool=include_task_tool,
-        )
-
-    from .runtime import build_shared_runtime
-
-    shared_runtime = build_shared_runtime(
-        llm,
-        subagent_registry,
-        skill_registry=skill_registry,
-    )
-    return shared_runtime.get_tools(
-        include_mcp=include_mcp,
-        include_task_tool=include_task_tool,
-    )
-
-
-def create_tools(
-    llm: BaseChatModel,
-    subagent_registry: SubAgentRegistry | None = None,
-    skill_registry: SkillRegistry | None = None,
-) -> list[BaseTool]:
-    """创建主Agent可用工具列表。
-
-    兼容旧入口；新代码优先通过 SharedToolRuntime 获取工具。
-    """
-    return get_available_tools(
-        llm,
-        subagent_registry,
-        include_mcp=False,
-        include_task_tool=True,
-        skill_registry=skill_registry,
-    )
+    ]

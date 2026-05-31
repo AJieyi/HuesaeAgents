@@ -21,7 +21,7 @@ class DoubaoVisionClient:
     """封装火山方舟 Doubao 多模态图片理解接口。"""
 
     BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-    DEFAULT_MODEL = "doubao-seed-2-0-mini-260428"
+
 
     def __init__(
         self,
@@ -29,7 +29,7 @@ class DoubaoVisionClient:
         api_key: str | None = None,
         timeout: int = 120,
     ):
-        self.model = model or os.getenv("DOUBAO_MODEL_NAME") or self.DEFAULT_MODEL
+        self.model = model or os.getenv("DOUBAO_MODEL_NAME")
         self.api_key = api_key or os.getenv("DOUBAO_API_KEY")
         self.timeout = timeout
 
